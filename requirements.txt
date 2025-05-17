@@ -1,4 +1,3 @@
-# Core dependencies
 streamlit
 transformers
 huggingface_hub
@@ -8,8 +7,6 @@ torch
 peft
 diffusers
 clip-interrogator
-
-# Optional: for cloud/colab, some may already be present
-# numpy
-# tqdm
-# accelerate
+numpy
+tqdm
+accelerate
