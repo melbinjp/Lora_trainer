@@ -1,17 +1,5 @@
 # LoRA Streamlit UI - Setup & Run Instructions
 
-## Google Colab (Recommended)
-
-- [Click here to open Google Colab](https://colab.research.google.com/github/melbinjp/Lora_trainer/blob/main/colab_quickstart.ipynb) and try to open the notebook directly.
-- If the above link does not work:
-  - Open [Google Colab](https://colab.research.google.com/).
-  - Go to **File → Open notebook → GitHub** tab.
-  - Paste this repo URL: `https://github.com/melbinjp/Lora_trainer`
-  - Select `colab_quickstart.ipynb` and open it.
-- Run all cells in order. The Streamlit UI will provide a public link.
-- After training, your model will be saved in `/content/Lora_trainer/lora_output/<your_model_name>`.
-- You can download or upload the model to Hugging Face directly from the Streamlit UI after training.
-
 ## Local (Windows, Linux, macOS)
 
 1. Clone this repository:
@@ -32,6 +20,11 @@
    ```sh
    streamlit run test.py
    ```
+
+## Google Colab (One-click)
+
+1. Open `colab_quickstart.ipynb` in Colab.
+2. Run all cells. The UI will be available via a public link.
 
 ## Cloud VM (AWS, GCP, etc.)
 

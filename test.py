@@ -27,13 +27,6 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 # --- Default settings and descriptions ---
-DEFAULT_BASE_MODEL = {
-    "modelId": "runwayml/stable-diffusion-v1-5",
-    "name": "Stable Diffusion v1.5",
-    "desc": "Popular base model for image generation and LoRA training.",
-    "compatible_lora": ["kohya-ss", "diffusers"],
-    "default": True
-}
 DEFAULT_LORA_METHOD = {
     "name": "kohya-ss LoRA",
     "desc": "Efficient and widely used LoRA training for diffusion models.",
@@ -213,9 +206,57 @@ def get_best_device_and_precision():
     except Exception as e:
         return "cpu", torch.float32, f"Device detection failed: {e}. Defaulting to CPU.", "unknown"
 
-# --- Sidebar: Hugging Face Token ---
-st.sidebar.header("Hugging Face Token (Required for Model Downloads)")
+# --- Sidebar: Hugging Face Token (Optional for default model) ---
+st.sidebar.header("Hugging Face Token (Optional, required only for custom/private models)")
 hf_token_global = st.sidebar.text_input("Hugging Face Token", type="password", key="hf_token_global")
+
+# --- System Resource Detection ---
+def get_system_resources():
+    import psutil
+    import platform
+    ram_gb = round(psutil.virtual_memory().total / (1024 ** 3), 2)
+    vram_gb = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            vram_gb = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 2)
+        elif hasattr(torch, 'has_mps') and torch.has_mps and torch.mps.is_available():
+            vram_gb = None  # Apple MPS: VRAM not easily available
+    except Exception:
+        pass
+    return ram_gb, vram_gb
+
+ram_gb, vram_gb = get_system_resources()
+st.sidebar.markdown(f"**Detected RAM:** {ram_gb} GB")
+if vram_gb:
+    st.sidebar.markdown(f"**Detected VRAM:** {vram_gb} GB")
+else:
+    st.sidebar.markdown("**Detected VRAM:** Not detected or not available")
+
+manual_ram = st.sidebar.number_input("Override RAM (GB, optional)", min_value=1.0, value=ram_gb, step=0.5)
+manual_vram = st.sidebar.number_input("Override VRAM (GB, optional)", min_value=0.0, value=vram_gb or 0.0, step=0.5)
+
+# --- Model Selection with Resource Check ---
+def get_default_model_for_resources(ram, vram):
+    # Example: You can expand this logic for more models
+    if vram and vram >= 8:
+        return {
+            "modelId": "runwayml/stable-diffusion-v1-5",
+            "name": "Stable Diffusion v1.5",
+            "desc": "Popular base model for image generation and LoRA training.",
+            "compatible_lora": ["kohya-ss", "diffusers"],
+            "default": True
+        }
+    else:
+        return {
+            "modelId": "stabilityai/sd-turbo",
+            "name": "SD Turbo (Efficient)",
+            "desc": "Very efficient, fast, and low-memory model for image generation and LoRA training.",
+            "compatible_lora": ["kohya-ss", "diffusers"],
+            "default": True
+        }
+
+DEFAULT_BASE_MODEL = get_default_model_for_resources(manual_ram, manual_vram)
 
 # --- Main UI ---
 st.title("LoRA Training UI (Easy & Advanced Modes)")
@@ -232,14 +273,9 @@ caption_type = st.radio("Captioning/Tagging Mode", ["Caption (Sentence)", "Tags 
 if images:
     # Always show images in the UI
     st.write("### Uploaded Images")
-    for idx, img in enumerate(images):
-        with st.container():
-            st.image(img, width=200, caption=img.name)
-            st.text_area(
-                f"{'Caption' if caption_type == 'Caption (Sentence)' else 'Tags'} for {img.name}",
-                value=st.session_state.get(f"caption_{idx}", ""),
-                key=f"caption_{idx}"
-            )
+    # --- Auto-caption/tag logic ---
+    auto_captions = st.session_state.get('auto_captions', None)
+    captions_ready = auto_captions is not None and len(auto_captions) == len(images)
     if caption_mode == "Automatic (Recommended)":
         st.info(f"Using BLIP model: `{DEFAULT_CAPTION_MODEL}` for automatic captioning.")
         if st.button("Auto Caption/Tag All Images"):
@@ -253,11 +289,34 @@ if images:
                         )
                     else:
                         gen_captions = generate_tags_for_images(images, hf_token_global)
-                    for idx, cap in enumerate(gen_captions):
-                        st.session_state[f"caption_{idx}"] = cap
-                    st.success("Captions/Tags generated! You can edit them below.")
+                    # Only set session state if all captions are generated successfully
+                    if gen_captions and len(gen_captions) == len(images):
+                        for idx, cap in enumerate(gen_captions):
+                            st.session_state[f"caption_{idx}"] = cap
+                        st.session_state['auto_captions'] = gen_captions
+                        st.experimental_rerun()
+                    else:
+                        st.error("Auto-captioning/tagging did not return captions for all images. Please try again.")
                 except Exception as e:
+                    # Clear any partial/failed results
+                    for idx in range(len(images)):
+                        st.session_state.pop(f"caption_{idx}", None)
+                    st.session_state.pop('auto_captions', None)
                     st.error(f"Auto-captioning/tagging failed: {e}")
+    # Set captions from auto_captions if available and not already set
+    if caption_mode == "Automatic (Recommended)" and captions_ready:
+        for idx, cap in enumerate(auto_captions):
+            if st.session_state.get(f"caption_{idx}") is None:
+                st.session_state[f"caption_{idx}"] = cap
+    # Render text areas for captions/tags
+    for idx, img in enumerate(images):
+        with st.container():
+            st.image(img, width=200, caption=img.name)
+            st.text_area(
+                f"{'Caption' if caption_type == "Caption (Sentence)" else 'Tags'} for {img.name}",
+                value=st.session_state.get(f"caption_{idx}", ""),
+                key=f"caption_{idx}"
+            )
 
 # --- Step 3: Base Model & LoRA Method (Default, with search/advanced) ---
 st.subheader("3. Base Model & LoRA Method")
@@ -275,13 +334,23 @@ with st.expander("Show/Change Model (Advanced)", expanded=False):
         if results:
             for r in results:
                 st.markdown(f"**{r['name']}**  \n_{r['desc']}_  \nTags: {r['tags']}")
+                # Example: Add a warning if model is large
+                if vram_gb and 'xl' in r['name'].lower() and vram_gb < 12:
+                    st.warning(f"Warning: {r['name']} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
         else:
             st.warning("No models found or error searching Hugging Face.")
-    # --- LoRA method selection (future) ---
-    # ... (dropdown for LoRA methods, if needed) ...
+    # --- Manual model selection ---
+    custom_model_id = st.text_input("Or enter a custom model ID (Hugging Face)")
+    if custom_model_id:
+        # Example: Check for large models
+        if vram_gb and ('xl' in custom_model_id.lower() or 'sdxl' in custom_model_id.lower()) and vram_gb < 12:
+            st.warning(f"Warning: {custom_model_id} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
+        # If user enters a custom model, require token
+        if not hf_token_global:
+            st.error("A Hugging Face token is required for custom/private models.")
 
-# --- Advanced Training Settings ---
-with st.expander("Advanced Training Settings", expanded=False):
+# --- Step 4: Advanced Training Settings ---
+with st.expander("4. Advanced Training Settings", expanded=False):
     batch_size = st.number_input("Batch Size", min_value=1, max_value=128, value=4)
     learning_rate = st.number_input("Learning Rate", min_value=1e-6, max_value=1e-2, value=1e-4, format="%e")
     epochs = st.number_input("Epochs", min_value=1, max_value=100, value=10)
@@ -293,7 +362,7 @@ with st.expander("Advanced Training Settings", expanded=False):
         "optimizer": optimizer
     }
 
-# --- Highly Advanced: Edit Training Config/Code ---
+# --- Step 5: Highly Advanced: Edit Training Config/Code ---
 default_code = (
     "# Example: Custom training config as Python dict\n"
     "custom_config = {\n"
@@ -303,34 +372,39 @@ default_code = (
     "    'optimizer': 'AdamW'\n"
     "}\n"
 )
-with st.expander("Highly Advanced: Edit Training Config/Code", expanded=False):
+with st.expander("5. Highly Advanced: Edit Training Config/Code", expanded=False):
     custom_code = st.text_area("Edit training config/code (Python)", value=default_code, height=180)
 
-# --- Step 4: LoRA Metadata ---
-st.subheader("4. LoRA Metadata")
+# --- Step 6: LoRA Metadata ---
+st.subheader("6. LoRA Metadata")
 lora_model_name = st.text_input("LoRA Model Name (required)", value="my_lora")
 lora_activation_keyword = st.text_input("Activation Keyword (required)", value="my_lora_keyword")
 
-# --- Step 5: Start Training ---
+# --- Step 7: Start Training ---
 if st.button("Start LoRA Training"):
     # Auto-generate captions/tags if in automatic mode and not already generated
     if caption_mode == "Automatic (Recommended)":
-        st.info("Auto-generating captions/tags for all images...")
-        try:
-            if caption_type == "Caption (Sentence)":
-                gen_captions = generate_captions_for_images(
-                    images,
-                    DEFAULT_CAPTION_MODEL,
-                    hf_token_global
-                )
-            else:
-                gen_captions = generate_tags_for_images(images, hf_token_global)
-            for idx, cap in enumerate(gen_captions):
-                st.session_state[f"caption_{idx}"] = cap
-            st.success("Captions/Tags generated!")
-        except Exception as e:
-            st.error(f"Auto-captioning/tagging failed: {e}")
-            st.stop()
+        auto_captions = st.session_state.get('auto_captions', None)
+        captions_ready = auto_captions is not None and len(auto_captions) == len(images)
+        if not captions_ready:
+            st.info("Auto-generating captions/tags for all images...")
+            try:
+                if caption_type == "Caption (Sentence)":
+                    gen_captions = generate_captions_for_images(
+                        images,
+                        DEFAULT_CAPTION_MODEL,
+                        hf_token_global
+                    )
+                else:
+                    gen_captions = generate_tags_for_images(images, hf_token_global)
+                for idx, cap in enumerate(gen_captions):
+                    st.session_state[f"caption_{idx}"] = cap
+                st.session_state['auto_captions'] = gen_captions
+                st.success("Captions/Tags generated!")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Auto-captioning/tagging failed: {e}")
+                st.stop()
     # Validate all images have captions/tags
     missing = [idx for idx in range(len(images)) if not st.session_state.get(f"caption_{idx}", "").strip()]
     if missing:
@@ -361,9 +435,9 @@ if st.button("Start LoRA Training"):
         st.session_state['trained_model_dir'] = output_dir
         st.session_state['model_ready'] = True
 
-# --- Step 6: Model Download & Upload Options ---
+# --- Step 8: Model Download & Upload Options ---
 if st.session_state.get('model_ready', False):
-    st.subheader("6. Model Download & Upload")
+    st.subheader("8. Model Download & Upload")
     model_dir = st.session_state['trained_model_dir']
     download_toggle = st.checkbox("Download model after training", value=True)
     upload_toggle = st.checkbox("Upload model to Hugging Face Hub", value=False)
@@ -390,19 +464,58 @@ if st.session_state.get('model_ready', False):
                 except Exception as e:
                     st.error(f"Upload failed: {e}")
 
-# --- Step 7: Generate Images with Trained Model ---
-if st.session_state.get('model_ready', False):
-    st.subheader("7. Generate Images with Trained Model")
-    st.info("You can now generate images using your newly trained LoRA model. Edit the prompts below as needed.")
-    sample_prompts = [
+# --- Step 9: Generate Images with Trained Model (Prompt Queue) ---
+st.subheader("9. Generate Images with Trained Model")
+
+# Helper to prepend activation keyword if not present
+def prepend_lora_keyword(prompt, keyword):
+    prompt = prompt.strip()
+    if keyword and keyword not in prompt:
+        return f"{keyword}, {prompt}"
+    return prompt
+
+# Initialize prompt queue in session state if not present or if keyword changed
+if 'last_lora_keyword' not in st.session_state or st.session_state.get('last_lora_keyword') != lora_activation_keyword:
+    default_prompts = [
         "A futuristic cityscape at sunset, ultra detailed, trending on artstation",
         "A portrait of a cat wearing sunglasses, digital art, vibrant colors",
         "A fantasy landscape with mountains and rivers, epic lighting"
     ]
-    prompts = [st.text_input(f"Prompt {i+1}", value=sample_prompts[i]) for i in range(len(sample_prompts))]
-    num_images = st.slider("Number of images to generate per prompt", 1, 4, 1)
-    if st.button("Generate Images"):
-        with st.spinner("Loading model and generating images..."):
+    st.session_state['queued_prompts'] = [prepend_lora_keyword(p, lora_activation_keyword) for p in default_prompts]
+    st.session_state['last_lora_keyword'] = lora_activation_keyword
+if 'queued_num_images' not in st.session_state:
+    st.session_state['queued_num_images'] = 1
+if 'auto_generate_images' not in st.session_state:
+    st.session_state['auto_generate_images'] = False
+
+# Prompt queue UI
+st.info("You can queue prompts and settings below. Images will be generated automatically as soon as training completes. The LoRA activation keyword will be included in each prompt.")
+
+# Editable prompt list (ensure keyword is present)
+for i, prompt in enumerate(st.session_state['queued_prompts']):
+    user_prompt = st.text_input(f"Prompt {i+1}", value=prompt, key=f"queued_prompt_{i}")
+    st.session_state['queued_prompts'][i] = prepend_lora_keyword(user_prompt, lora_activation_keyword)
+
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Add Prompt"):
+        st.session_state['queued_prompts'].append(prepend_lora_keyword("", lora_activation_keyword))
+with col2:
+    if len(st.session_state['queued_prompts']) > 1:
+        remove_idx = st.number_input("Remove prompt #", min_value=1, max_value=len(st.session_state['queued_prompts']), value=1, step=1, key="remove_prompt_idx")
+        if st.button("Remove Prompt"):
+            st.session_state['queued_prompts'].pop(remove_idx-1)
+
+num_images = st.slider("Number of images to generate per prompt", 1, 4, st.session_state['queued_num_images'], key="queued_num_images")
+
+# If model is not ready, show info
+if not st.session_state.get('model_ready', False):
+    st.info("Model is not ready yet. Images will be generated automatically with the above prompts and settings as soon as training completes.")
+    st.session_state['auto_generate_images'] = True
+else:
+    # If auto_generate_images is set, generate images automatically
+    if st.session_state.get('auto_generate_images', False):
+        with st.spinner("Loading model and generating images for queued prompts..."):
             try:
                 device, precision, device_msg, torch_version = get_best_device_and_precision()
                 pipe = StableDiffusionPipeline.from_pretrained(
@@ -410,10 +523,31 @@ if st.session_state.get('model_ready', False):
                     torch_dtype=precision
                 )
                 pipe = pipe.to(device)
-                for prompt in prompts:
-                    st.markdown(f"**Prompt:** {prompt}")
-                    images = pipe([prompt]*num_images).images
+                for prompt in st.session_state['queued_prompts']:
+                    prompt_with_keyword = prepend_lora_keyword(prompt, lora_activation_keyword)
+                    st.markdown(f"**Prompt:** {prompt_with_keyword}")
+                    images = pipe([prompt_with_keyword]*st.session_state['queued_num_images']).images
                     for img in images:
                         st.image(img)
+                st.session_state['auto_generate_images'] = False  # Only auto-generate once
             except Exception as e:
                 st.error(f"Image generation failed: {e}")
+    else:
+        # Manual trigger if user wants to re-generate
+        if st.button("Generate Images"):
+            with st.spinner("Loading model and generating images for queued prompts..."):
+                try:
+                    device, precision, device_msg, torch_version = get_best_device_and_precision()
+                    pipe = StableDiffusionPipeline.from_pretrained(
+                        st.session_state['trained_model_dir'],
+                        torch_dtype=precision
+                    )
+                    pipe = pipe.to(device)
+                    for prompt in st.session_state['queued_prompts']:
+                        prompt_with_keyword = prepend_lora_keyword(prompt, lora_activation_keyword)
+                        st.markdown(f"**Prompt:** {prompt_with_keyword}")
+                        images = pipe([prompt_with_keyword]*st.session_state['queued_num_images']).images
+                        for img in images:
+                            st.image(img)
+                except Exception as e:
+                    st.error(f"Image generation failed: {e}")
