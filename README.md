@@ -1,5 +1,7 @@
 # LoRA Streamlit UI - Setup & Run Instructions
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/melbinjp/Lora_trainer_streamlitui/blob/main/colab_quickstart.ipynb)
+
 ## Local (Windows, Linux, macOS)
 
 1. Clone this repository:
