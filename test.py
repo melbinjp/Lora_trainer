@@ -128,14 +128,14 @@ def search_hf_models(query, hf_token):
     else:
         return []
 
-def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None):
+def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
     pipe = download_with_progress(
         base_model_id,
         "Stable Diffusion base model for LoRA training.",
         StableDiffusionPipeline.from_pretrained,
         base_model_id,
         use_auth_token=hf_token,
-        torch_dtype=torch.float16 if device in ["cuda", "npu"] else torch.float32,
+        torch_dtype=precision if precision is not None else (torch.float16 if device in ["cuda", "npu"] else torch.float32),
         safety_checker=None,
         scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     )
@@ -185,6 +185,33 @@ def upload_model_to_hf(model_dir, hf_token, base_name, user_name):
         token=hf_token
     )
     return f"https://huggingface.co/{repo_id}"
+
+# --- Device selection: NPU/GPU/CPU/MPS/ROCm ---
+def get_best_device_and_precision():
+    try:
+        import torch
+        device = "cpu"
+        precision = torch.float32
+        device_msg = "CPU detected. Training will be slow."
+        if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            device = "cuda"
+            precision = torch.float16
+            device_msg = "CUDA GPU detected. Using float16 for best performance."
+        elif hasattr(torch, 'has_mps') and torch.has_mps and torch.mps.is_available():
+            device = "mps"
+            precision = torch.float16
+            device_msg = "Apple MPS detected. Using float16 for best performance."
+        elif hasattr(torch, 'has_hip') and torch.has_hip and torch.has_hip():
+            device = "cuda"  # ROCm is seen as 'cuda' in torch
+            precision = torch.float16
+            device_msg = "AMD ROCm detected. Using float16 for best performance."
+        elif hasattr(torch, 'npu') and torch.npu.is_available():
+            device = "npu"
+            precision = torch.float16
+            device_msg = "NPU detected. Using float16 for best performance."
+        return device, precision, device_msg, torch.__version__
+    except Exception as e:
+        return "cpu", torch.float32, f"Device detection failed: {e}. Defaulting to CPU.", "unknown"
 
 # --- Sidebar: Hugging Face Token ---
 st.sidebar.header("Hugging Face Token (Required for Model Downloads)")
@@ -312,27 +339,11 @@ if st.button("Start LoRA Training"):
         captions = [st.session_state.get(f"caption_{idx}", "") for idx in range(len(images))]
         output_dir = f"lora_output/{lora_model_name}"
         st.info("Training LoRA... This may take a while.")
-        # --- Device selection: NPU/GPU/CPU/MPS ---
-        try:
-            device = "cpu"
-            if hasattr(torch, 'npu') and torch.npu.is_available():
-                device = "npu"
-            elif torch.cuda.is_available():
-                device = "cuda"
-            elif hasattr(torch, 'has_mps') and torch.has_mps and torch.mps.is_available():
-                device = "mps"
-            st.info(f"Using device: {device}")
-            if device == "cpu":
-                st.warning("No GPU/NPU/MPS detected. Training will be slow. For best performance, use a machine with a supported GPU or Apple Silicon (MPS). See https://pytorch.org/get-started/locally/ for install instructions.")
-            elif device == "cuda":
-                st.info("CUDA GPU detected. Ensure you have the correct torch version for your CUDA version.")
-            elif device == "mps":
-                st.info("Apple MPS detected. For best performance, use torch>=1.12 on Mac.")
-            elif device == "npu":
-                st.info("NPU detected. Using NPU for training.")
-        except Exception as e:
-            st.error(f"Device detection failed: {e}. Defaulting to CPU.")
-            device = "cpu"
+        # --- Improved Device selection ---
+        device, precision, device_msg, torch_version = get_best_device_and_precision()
+        st.info(f"{device_msg} (torch version: {torch_version})")
+        if device == "cpu":
+            st.warning("No supported accelerator detected. Training will be slow. For best performance, use a machine with a supported GPU, Apple Silicon (MPS), or AMD ROCm. See https://pytorch.org/get-started/locally/ for install instructions.")
         train_lora(
             images,
             captions,
@@ -343,7 +354,8 @@ if st.button("Start LoRA Training"):
             hf_token_global,
             device,
             adv_config=adv_config,
-            custom_code=custom_code
+            custom_code=custom_code,
+            precision=precision
         )
         st.success(f"LoRA training complete! Weights saved to {output_dir}")
         st.session_state['trained_model_dir'] = output_dir
@@ -392,11 +404,12 @@ if st.session_state.get('model_ready', False):
     if st.button("Generate Images"):
         with st.spinner("Loading model and generating images..."):
             try:
+                device, precision, device_msg, torch_version = get_best_device_and_precision()
                 pipe = StableDiffusionPipeline.from_pretrained(
                     st.session_state['trained_model_dir'],
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                    torch_dtype=precision
                 )
-                pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
+                pipe = pipe.to(device)
                 for prompt in prompts:
                     st.markdown(f"**Prompt:** {prompt}")
                     images = pipe([prompt]*num_images).images
