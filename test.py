@@ -14,6 +14,10 @@ from peft import LoraConfig, get_peft_model
 import threading
 import time
 from huggingface_hub import hf_hub_download
+import os
+import random
+from datetime import datetime
+from huggingface_hub import HfApi
 
 # Try to import torch for GPU info, if available
 try:
@@ -165,6 +169,22 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
     # Save LoRA weights
     pipe.unet.save_pretrained(output_dir)
     return output_dir
+
+def upload_model_to_hf(model_dir, hf_token, base_name, user_name):
+    """
+    Uploads the model to Hugging Face Hub with a unique name (timestamp-based).
+    Returns the repo URL if successful.
+    """
+    api = HfApi()
+    unique_name = f"{base_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(1000,9999)}"
+    repo_id = f"{user_name}/{unique_name}"
+    api.create_repo(name=unique_name, exist_ok=True, token=hf_token)
+    api.upload_folder(
+        folder_path=model_dir,
+        repo_id=repo_id,
+        token=hf_token
+    )
+    return f"https://huggingface.co/{repo_id}"
 
 # --- Sidebar: Hugging Face Token ---
 st.sidebar.header("Hugging Face Token (Required for Model Downloads)")
@@ -326,3 +346,61 @@ if st.button("Start LoRA Training"):
             custom_code=custom_code
         )
         st.success(f"LoRA training complete! Weights saved to {output_dir}")
+        st.session_state['trained_model_dir'] = output_dir
+        st.session_state['model_ready'] = True
+
+# --- Step 6: Model Download & Upload Options ---
+if st.session_state.get('model_ready', False):
+    st.subheader("6. Model Download & Upload")
+    model_dir = st.session_state['trained_model_dir']
+    download_toggle = st.checkbox("Download model after training", value=True)
+    upload_toggle = st.checkbox("Upload model to Hugging Face Hub", value=False)
+    hf_username = st.text_input("Your Hugging Face username (for upload)", value="", key="hf_username")
+    if download_toggle:
+        # Zip the model directory for download
+        zip_path = f"{model_dir}.zip"
+        if not os.path.exists(zip_path):
+            shutil.make_archive(model_dir, 'zip', model_dir)
+        with open(zip_path, "rb") as f:
+            st.download_button("Download Trained Model (.zip)", f, file_name=os.path.basename(zip_path))
+        st.info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
+    else:
+        st.info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
+    if upload_toggle and st.button("Upload Model to Hugging Face"):
+        if not hf_token_global or not hf_username:
+            st.warning("Please provide your Hugging Face token and username.")
+        else:
+            with st.spinner("Uploading model to Hugging Face Hub..."):
+                try:
+                    repo_url = upload_model_to_hf(model_dir, hf_token_global, lora_model_name, hf_username)
+                    st.success(f"Model uploaded to Hugging Face: {repo_url}")
+                    st.markdown(f"[View on Hugging Face]({repo_url})")
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+
+# --- Step 7: Generate Images with Trained Model ---
+if st.session_state.get('model_ready', False):
+    st.subheader("7. Generate Images with Trained Model")
+    st.info("You can now generate images using your newly trained LoRA model. Edit the prompts below as needed.")
+    sample_prompts = [
+        "A futuristic cityscape at sunset, ultra detailed, trending on artstation",
+        "A portrait of a cat wearing sunglasses, digital art, vibrant colors",
+        "A fantasy landscape with mountains and rivers, epic lighting"
+    ]
+    prompts = [st.text_input(f"Prompt {i+1}", value=sample_prompts[i]) for i in range(len(sample_prompts))]
+    num_images = st.slider("Number of images to generate per prompt", 1, 4, 1)
+    if st.button("Generate Images"):
+        with st.spinner("Loading model and generating images..."):
+            try:
+                pipe = StableDiffusionPipeline.from_pretrained(
+                    st.session_state['trained_model_dir'],
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                )
+                pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
+                for prompt in prompts:
+                    st.markdown(f"**Prompt:** {prompt}")
+                    images = pipe([prompt]*num_images).images
+                    for img in images:
+                        st.image(img)
+            except Exception as e:
+                st.error(f"Image generation failed: {e}")
