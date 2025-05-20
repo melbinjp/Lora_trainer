@@ -626,6 +626,12 @@ with st.expander("Show/Change Model (Advanced)", expanded=False):
         if vram_gb and ('xl' in custom_model_id.lower() or 'sdxl' in custom_model_id.lower()) and vram_gb < 12:
             st.warning(f"Warning: {custom_model_id} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
 
+# --- Step 6: LoRA Metadata ---
+st.subheader("6. LoRA Metadata")
+lora_model_name = st.text_input("LoRA Model Name (required)", value="my_lora")
+lora_activation_keyword = st.text_input("Activation Keyword (required)", value="my_lora_keyword")
+hf_repo_name = st.text_input("Hugging Face Repo Name (required, will be created if not exists)", value=f"lora-{lora_model_name}")
+
 # --- Step 7: Start LoRA Training ---
 # Ensure custom_code is always defined
 if 'custom_code' not in locals():
