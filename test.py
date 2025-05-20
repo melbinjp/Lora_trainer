@@ -259,19 +259,25 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
     # --- Training loop ---
     st.info(f"Starting LoRA training for {config['epochs']} epochs...")
     global_step = 0
+    # Get pipeline dtype for correct casting
+    pipe_dtype = pipe.unet.dtype if hasattr(pipe.unet, 'dtype') else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32)
     for epoch in range(config['epochs']):
         running_loss = 0.0
         for step, (images_batch, captions_batch) in enumerate(dataloader):
             with accelerator.accumulate(pipe.unet):
-                images_batch = images_batch.to(device)
+                # Move images to device and correct dtype
+                images_batch = images_batch.to(device=device, dtype=pipe_dtype)
                 prompts = list(captions_batch)
                 try:
-                    latents = pipe.vae.encode(images_batch).latent_dist.sample()
+                    # VAE encode expects correct dtype
+                    latents = pipe.vae.encode(images_batch).latent_dist.sample().to(device=device, dtype=pipe_dtype)
                     latents = latents * pipe.vae.config.scaling_factor
-                    noise = torch.randn_like(latents)
+                    noise = torch.randn_like(latents, device=device, dtype=pipe_dtype)
                     timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (images_batch.shape[0],), device=device).long()
                     noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
-                    encoder_hidden_states = pipe.text_encoder(pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt").input_ids.to(device))[0]
+                    # Tokenizer/text encoder expects input_ids on device
+                    input_ids = pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt").input_ids.to(device)
+                    encoder_hidden_states = pipe.text_encoder(input_ids)[0]
                     model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states).sample
                     target = noise
                     loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -289,6 +295,12 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
                     st.info(f"Epoch {epoch+1}/{config['epochs']}, Step {step+1}, Loss: {loss.item():.4f}")
         avg_loss = running_loss / (step+1)
         st.info(f"Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
+
+    # --- Check LoRA layers are present ---
+    if not hasattr(pipe, 'lora_layers') or not pipe.lora_layers:
+        st.error("No LoRA layers found in the pipeline. Training did not modify any LoRA weights.")
+        shutil.rmtree(temp_dir)
+        return None
 
     # --- Save LoRA weights using diffusers API ---
     st.info("Saving LoRA weights...")
