@@ -35,9 +35,9 @@ DEFAULT_LORA_METHOD = {
 }
 DEFAULT_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# --- Caching for Captioning/Tagging Models ---
+# --- Caching for Model Files Only (not full model objects) ---
 @st.cache_resource(show_spinner=False)
-def get_blip_model(hf_token):
+def get_blip_model_files(hf_token):
     processor = BlipProcessor.from_pretrained(
         DEFAULT_CAPTION_MODEL,
         use_auth_token=hf_token
@@ -49,13 +49,19 @@ def get_blip_model(hf_token):
     return processor, model
 
 @st.cache_resource(show_spinner=False)
-def get_clip_interrogator():
+def get_clip_interrogator_files():
     ci = Interrogator(Config(clip_model_name="ViT-L-14/openai"))
     return ci
 
-# --- Updated Caption/Tag Generation Functions ---
+# --- Updated Caption/Tag Generation Functions with Progress Bar ---
 def generate_captions_for_images(images, hf_token):
-    processor, model = get_blip_model(hf_token)
+    st.info(f"Loading BLIP model for captioning...")
+    progress_bar = st.progress(0)
+    processor, model = get_blip_model_files(hf_token)
+    progress_bar.progress(50)
+    # Simulate model instantiation/loading (if needed)
+    time.sleep(0.2)
+    progress_bar.progress(100)
     captions = []
     for img_file in images:
         image = Image.open(img_file).convert('RGB')
@@ -63,15 +69,23 @@ def generate_captions_for_images(images, hf_token):
         out = model.generate(**inputs, max_new_tokens=30)
         caption = processor.decode(out[0], skip_special_tokens=True)
         captions.append(caption)
+    progress_bar.empty()
     return captions
 
 def generate_tags_for_images(images):
-    ci = get_clip_interrogator()
+    st.info(f"Loading CLIP Interrogator for tagging...")
+    progress_bar = st.progress(0)
+    ci = get_clip_interrogator_files()
+    progress_bar.progress(50)
+    # Simulate model instantiation/loading (if needed)
+    time.sleep(0.2)
+    progress_bar.progress(100)
     tags = []
     for img_file in images:
         image = Image.open(img_file).convert('RGB')
         tag = ci.interrogate(image)
         tags.append(tag)
+    progress_bar.empty()
     return tags
 
 def search_hf_models(query, hf_token):
