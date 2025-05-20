@@ -201,8 +201,16 @@ def get_best_device_and_precision():
         return "cpu", torch.float32, f"Device detection failed: {e}. Defaulting to CPU.", "unknown"
 
 # --- Sidebar: Hugging Face Token (Optional for default model) ---
-st.sidebar.header("Hugging Face Token (Optional, required only for custom/private models)")
-hf_token_global = st.sidebar.text_input("Hugging Face Token", type="password", key="hf_token_global")
+import os
+colab_hf_token = os.environ.get('HF_TOKEN', None)
+if colab_hf_token:
+    st.sidebar.info('Hugging Face token loaded from Colab secret (HF_TOKEN). You can override below if needed.')
+hf_token_global = st.sidebar.text_input(
+    "Hugging Face Token",
+    type="password",
+    key="hf_token_global",
+    value=colab_hf_token if colab_hf_token else ""
+)
 
 # --- System Resource Detection ---
 def get_system_resources():
