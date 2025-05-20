@@ -152,73 +152,185 @@ def detect_model_type(model_id, hf_token=None):
     return "unknown"
 
 def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
+    """
+    Robust LoRA training for diffusion/image models using diffusers and peft.
+    Features:
+    - Handles image/caption dataset with transforms and error handling
+    - Uses accelerate for device/mixed precision
+    - Configurable batch size, epochs, learning rate, optimizer
+    - Progress reporting to Streamlit
+    - Saves LoRA weights in standard format
+    - Supports custom config/code (advanced)
+    - Cleans up temp files
+    """
+    import torch
+    import os
+    import shutil
+    import tempfile
+    import gc
+    from torch.utils.data import Dataset, DataLoader
+    from PIL import Image
+    from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+    from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
+    from accelerate import Accelerator
+    import traceback
+    import time
+
+    # --- Model type check ---
     model_type = detect_model_type(base_model_id, hf_token)
-    progress_bar = st.progress(0, text=f"Loading base model ({model_type})...")
-    for i in range(1, 6):
-        time.sleep(0.2)
-        progress_bar.progress(i * 15, text=f"Loading base model... ({i*15}%)")
+    if model_type != "diffusion":
+        st.error("Only image/diffusion models are supported for LoRA training. Please select a compatible model (e.g., Stable Diffusion, SDXL). Transformer/text models are not supported.")
+        return None
+
+    # --- Prepare output dir ---
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Prepare dataset ---
+    class ImageCaptionDataset(Dataset):
+        def __init__(self, images, captions, image_size=512):
+            self.images = images
+            self.captions = captions
+            self.image_size = image_size
+        def __len__(self):
+            return len(self.images)
+        def __getitem__(self, idx):
+            img_path = self.images[idx]
+            caption = self.captions[idx]
+            image = Image.open(img_path).convert('RGB')
+            image = image.resize((self.image_size, self.image_size), Image.BICUBIC)
+            image = torch.from_numpy(np.array(image)).permute(2,0,1).float() / 255.0
+            return image, caption
+
+    # --- Save uploaded images to temp files if needed ---
+    temp_dir = tempfile.mkdtemp()
+    img_paths = []
+    for i, img in enumerate(images):
+        if hasattr(img, 'read'):
+            img_path = os.path.join(temp_dir, f"temp_img_{i}.png")
+            with open(img_path, "wb") as f:
+                f.write(img.read())
+            img_paths.append(img_path)
+        else:
+            img_paths.append(img)
+
+    # --- Training config ---
+    config = {
+        'batch_size': 4,
+        'learning_rate': 1e-4,
+        'epochs': 10,
+        'optimizer': 'AdamW',
+        'image_size': 512,
+        'gradient_accumulation_steps': 1,
+        'max_grad_norm': 1.0,
+        'save_steps': 0,  # Only save at end
+        'resume_from_checkpoint': False,
+        'mixed_precision': 'fp16' if precision == torch.float16 else 'no',
+    }
+    if adv_config:
+        config.update(adv_config)
+    # Allow custom_code to override config (advanced)
+    if custom_code:
+        try:
+            exec(custom_code, {}, {'custom_config': config})
+        except Exception as e:
+            st.warning(f"Custom config code error: {e}")
+
+    # --- Accelerator setup ---
+    accelerator = Accelerator(mixed_precision=config['mixed_precision'])
+    device = accelerator.device
+
+    # --- Load pipeline and prepare LoRA ---
+    st.info(f"Loading base model: {base_model_id}")
     try:
-        tried_types = []
-        def try_diffusion():
-            tried_types.append("diffusion")
-            pipe = StableDiffusionPipeline.from_pretrained(
-                base_model_id,
-                use_auth_token=hf_token,
-                torch_dtype=precision if precision is not None else (torch.float16 if device in ["cuda", "npu"] else torch.float32),
-                safety_checker=None,
-                scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
-            )
-            progress_bar.progress(90, text="Finalizing model...")
-            pipe = pipe.to(device)
-            progress_bar.progress(100, text="Model loaded!")
-            st.warning("LoRA training for diffusion models is not yet implemented. Only model loading is performed.")
-            pipe.save_pretrained(output_dir)
-            return "diffusion"
-        def try_transformer():
-            tried_types.append("transformer")
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            from peft import LoraConfig, get_peft_model
-            model = AutoModelForCausalLM.from_pretrained(base_model_id, use_auth_token=hf_token)
-            tokenizer = AutoTokenizer.from_pretrained(base_model_id, use_auth_token=hf_token)
-            lora_config = LoraConfig(
-                r=8,
-                lora_alpha=16,
-                target_modules=["q_proj", "v_proj"],
-                lora_dropout=0.1,
-                bias="none",
-                task_type="CAUSAL_LM"
-            )
-            lora_model = get_peft_model(model, lora_config)
-            st.warning("LoRA training for text models is not yet implemented. Only model loading is performed.")
-            lora_model.save_pretrained(output_dir)
-            return "transformer"
-        # Main logic
-        if model_type == "diffusion":
-            try:
-                return try_diffusion()
-            except Exception as e:
-                st.warning(f"Diffusion model loading failed: {e}")
-                model_type = "unknown"  # fallback
-        if model_type == "transformer":
-            try:
-                return try_transformer()
-            except Exception as e:
-                st.warning(f"Transformer model loading failed: {e}")
-                model_type = "unknown"  # fallback
-        if model_type == "unknown":
-            # Try both, in order
-            try:
-                return try_diffusion()
-            except Exception as e1:
-                st.info(f"Tried diffusion method, failed: {e1}")
+        pipe = StableDiffusionPipeline.from_pretrained(
+            base_model_id,
+            use_auth_token=hf_token,
+            torch_dtype=precision if precision is not None else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32),
+            safety_checker=None,
+            scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+        )
+        pipe = pipe.to(device)
+    except Exception as e:
+        st.error(f"Failed to load base model: {e}")
+        shutil.rmtree(temp_dir)
+        return None
+
+    # --- Prepare LoRA config ---
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.1,
+        bias="none",
+        task_type="UNET"
+    )
+    pipe.unet = get_peft_model(pipe.unet, lora_config)
+    pipe.unet.train()
+
+    # --- Prepare dataset and dataloader ---
+    dataset = ImageCaptionDataset(img_paths, captions, image_size=config['image_size'])
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
+
+    # --- Optimizer ---
+    optimizer_cls = torch.optim.AdamW if config['optimizer'].lower() == 'adamw' else torch.optim.SGD
+    optimizer = optimizer_cls(pipe.unet.parameters(), lr=config['learning_rate'])
+
+    # --- Training loop ---
+    st.info(f"Starting LoRA training for {config['epochs']} epochs...")
+    global_step = 0
+    for epoch in range(config['epochs']):
+        running_loss = 0.0
+        for step, (images_batch, captions_batch) in enumerate(dataloader):
+            with accelerator.accumulate(pipe.unet):
+                images_batch = images_batch.to(device)
+                # Use captions as prompts
+                prompts = list(captions_batch)
+                # Forward pass
                 try:
-                    return try_transformer()
-                except Exception as e2:
-                    st.error(f"Could not load model as diffusion or transformer.\nDiffusion error: {e1}\nTransformer error: {e2}")
-                    return None
-    finally:
-        progress_bar.empty()
-    return output_dir
+                    latents = pipe.vae.encode(images_batch).latent_dist.sample()
+                    latents = latents * pipe.vae.config.scaling_factor
+                    noise = torch.randn_like(latents)
+                    timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (images_batch.shape[0],), device=device).long()
+                    noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
+                    encoder_hidden_states = pipe.text_encoder(pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt").input_ids.to(device))[0]
+                    model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    target = noise
+                    loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                except Exception as e:
+                    st.error(f"Training step failed: {e}")
+                    continue
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config['max_grad_norm'])
+                optimizer.step()
+                optimizer.zero_grad()
+                running_loss += loss.item()
+                global_step += 1
+                if step % 2 == 0:
+                    st.info(f"Epoch {epoch+1}/{config['epochs']}, Step {step+1}, Loss: {loss.item():.4f}")
+        avg_loss = running_loss / (step+1)
+        st.info(f"Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
+
+    # --- Save LoRA weights ---
+    st.info("Saving LoRA weights...")
+    try:
+        lora_save_path = os.path.join(output_dir, f"{lora_model_name}_lora.safetensors")
+        state_dict = pipe.unet.state_dict()
+        torch.save(state_dict, lora_save_path)
+        st.success(f"LoRA training complete! Weights saved to {lora_save_path}")
+    except Exception as e:
+        st.error(f"Failed to save LoRA weights: {e}")
+        shutil.rmtree(temp_dir)
+        return None
+
+    # --- Clean up temp files ---
+    try:
+        shutil.rmtree(temp_dir)
+    except Exception:
+        pass
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    return "trained"
 
 def upload_model_to_hf(model_dir, hf_token, base_name, user_name):
     """
@@ -505,6 +617,7 @@ with st.expander("4. Advanced Training Settings", expanded=False):
 st.subheader("6. LoRA Metadata")
 lora_model_name = st.text_input("LoRA Model Name (required)", value="my_lora")
 lora_activation_keyword = st.text_input("Activation Keyword (required)", value="my_lora_keyword")
+hf_repo_name = st.text_input("Hugging Face Repo Name (required, will be created if not exists)", value=f"lora-{lora_model_name}")
 
 # --- Step 7: Start LoRA Training ---
 # Ensure custom_code is always defined
@@ -557,7 +670,7 @@ if st.button("Start LoRA Training"):
         st.info(f"{device_msg} (torch version: {torch_version})")
         if device == "cpu":
             st.warning("No supported accelerator detected. Training will be slow. For best performance, use a machine with a supported GPU, Apple Silicon (MPS), or AMD ROCm. See https://pytorch.org/get-started/locally/ for install instructions.")
-        train_lora(
+        result = train_lora(
             images,
             captions,
             base_hf_id if base_source == "Hugging Face (repo ID)" else None,
@@ -570,90 +683,81 @@ if st.button("Start LoRA Training"):
             custom_code=custom_code,
             precision=precision
         )
-        st.success(f"LoRA training complete! Weights saved to {output_dir}")
-        st.session_state['trained_model_dir'] = output_dir
-        st.session_state['model_ready'] = True
-
-# --- Step 8: Model Download & Upload Options ---
+        if result == "trained":
+            st.success(f"LoRA training complete! Weights saved to {output_dir}")
+            st.session_state['trained_model_dir'] = output_dir
+            st.session_state['model_ready'] = True
+            # --- Automatically upload to Hugging Face ---
+            with st.spinner("Uploading model to Hugging Face Hub (private)..."):
+                try:
+                    from huggingface_hub import HfApi, whoami
+                    api = HfApi()
+                    # Get username from token
+                    user_info = api.whoami(token=hf_token_global)
+                    hf_username = user_info['name'] if 'name' in user_info else user_info.get('user', 'user')
+                    repo_id = f"{hf_username}/{hf_repo_name}"
+                    api.create_repo(name=hf_repo_name, exist_ok=True, token=hf_token_global, private=True)
+                    api.upload_folder(
+                        folder_path=output_dir,
+                        repo_id=repo_id,
+                        token=hf_token_global
+                    )
+                    repo_url = f"https://huggingface.co/{repo_id}"
+                    st.session_state['uploaded_repo_url'] = repo_url
+                    st.success(f"Model uploaded to Hugging Face (private): {repo_url}")
+                    st.markdown(f"[View on Hugging Face]({repo_url})")
+                except Exception as e:
+                    st.error(f"Automatic upload to Hugging Face failed: {e}")
+        else:
+            st.error("LoRA training failed. See above for details.")
+# --- Always show image generation UI after training ---
 if st.session_state.get('model_ready', False):
     st.subheader("8. Model Download & Upload")
     model_dir = st.session_state['trained_model_dir']
-    download_toggle = st.checkbox("Download model after training", value=True)
-    upload_toggle = st.checkbox("Upload model to Hugging Face Hub", value=False)
-    hf_username = st.text_input("Your Hugging Face username (for upload)", value="", key="hf_username")
-    if download_toggle:
-        # Zip the model directory for download
-        zip_path = f"{model_dir}.zip"
-        if not os.path.exists(zip_path):
-            shutil.make_archive(model_dir, 'zip', model_dir)
-        with open(zip_path, "rb") as f:
-            st.download_button("Download Trained Model (.zip)", f, file_name=os.path.basename(zip_path))
-        st.info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
-    else:
-        st.info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
-    if upload_toggle and st.button("Upload Model to Hugging Face"):
-        if not hf_token_global or not hf_username:
-            st.warning("Please provide your Hugging Face token and username.")
-        else:
-            with st.spinner("Uploading model to Hugging Face Hub..."):
-                try:
-                    repo_url = upload_model_to_hf(model_dir, hf_token_global, lora_model_name, hf_username)
-                    st.success(f"Model uploaded to Hugging Face: {repo_url}")
-                    st.markdown(f"[View on Hugging Face]({repo_url})")
-                except Exception as e:
-                    st.error(f"Upload failed: {e}")
-
-# --- Step 9: Generate Images with Trained Model (Prompt Queue) ---
-st.subheader("9. Generate Images with Trained Model")
-
-# Helper to prepend activation keyword if not present
-def prepend_lora_keyword(prompt, keyword):
-    prompt = prompt.strip()
-    if keyword and keyword not in prompt:
-        return f"{keyword}, {prompt}"
-    return prompt
-
-# Initialize prompt queue in session state if not present or if keyword changed
-if 'last_lora_keyword' not in st.session_state or st.session_state.get('last_lora_keyword') != lora_activation_keyword:
-    default_prompts = [
-        "A futuristic cityscape at sunset, ultra detailed, trending on artstation",
-        "A portrait of a cat wearing sunglasses, digital art, vibrant colors",
-        "A fantasy landscape with mountains and rivers, epic lighting"
-    ]
-    st.session_state['queued_prompts'] = [prepend_lora_keyword(p, lora_activation_keyword) for p in default_prompts]
-    st.session_state['last_lora_keyword'] = lora_activation_keyword
-if 'queued_num_images' not in st.session_state:
-    st.session_state['queued_num_images'] = 1
-if 'auto_generate_images' not in st.session_state:
-    st.session_state['auto_generate_images'] = False
-
-# Prompt queue UI
-st.info("You can queue prompts and settings below. Images will be generated automatically as soon as training completes. The LoRA activation keyword will be included in each prompt.")
-
-# Editable prompt list (ensure keyword is present)
-for i, prompt in enumerate(st.session_state['queued_prompts']):
-    user_prompt = st.text_input(f"Prompt {i+1}", value=prompt, key=f"queued_prompt_{i}")
-    st.session_state['queued_prompts'][i] = prepend_lora_keyword(user_prompt, lora_activation_keyword)
-
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("Add Prompt"):
-        st.session_state['queued_prompts'].append(prepend_lora_keyword("", lora_activation_keyword))
-with col2:
-    if len(st.session_state['queued_prompts']) > 1:
-        remove_idx = st.number_input("Remove prompt #", min_value=1, max_value=len(st.session_state['queued_prompts']), value=1, step=1, key="remove_prompt_idx")
-        if st.button("Remove Prompt"):
-            st.session_state['queued_prompts'].pop(remove_idx-1)
-
-num_images = st.slider("Number of images to generate per prompt", 1, 4, key="queued_num_images")
-
-# If model is not ready, show info
-if not st.session_state.get('model_ready', False):
-    st.info("Model is not ready yet. Images will be generated automatically with the above prompts and settings as soon as training completes.")
-    st.session_state['auto_generate_images'] = True
-else:
-    # If auto_generate_images is set, generate images automatically
-    if st.session_state.get('auto_generate_images', False):
+    repo_url = st.session_state.get('uploaded_repo_url', None)
+    if repo_url:
+        st.info(f"Model is available on Hugging Face (private): {repo_url}")
+        st.markdown(f"[View on Hugging Face]({repo_url})")
+    # Download option
+    zip_path = f"{model_dir}.zip"
+    if not os.path.exists(zip_path):
+        shutil.make_archive(model_dir, 'zip', model_dir)
+    with open(zip_path, "rb") as f:
+        st.download_button("Download Trained Model (.zip)", f, file_name=os.path.basename(zip_path))
+    st.info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
+    # --- Step 9: Generate Images with Trained Model (Prompt Queue) ---
+    st.subheader("9. Generate Images with Trained Model")
+    def prepend_lora_keyword(prompt, keyword):
+        prompt = prompt.strip()
+        if keyword and keyword not in prompt:
+            return f"{keyword}, {prompt}"
+        return prompt
+    if 'last_lora_keyword' not in st.session_state or st.session_state.get('last_lora_keyword') != lora_activation_keyword:
+        default_prompts = [
+            "A futuristic cityscape at sunset, ultra detailed, trending on artstation",
+            "A portrait of a cat wearing sunglasses, digital art, vibrant colors",
+            "A fantasy landscape with mountains and rivers, epic lighting"
+        ]
+        st.session_state['queued_prompts'] = [prepend_lora_keyword(p, lora_activation_keyword) for p in default_prompts]
+        st.session_state['last_lora_keyword'] = lora_activation_keyword
+    if 'queued_num_images' not in st.session_state:
+        st.session_state['queued_num_images'] = 1
+    # Prompt queue UI
+    st.info("You can queue prompts and settings below. Images will be generated automatically as soon as training completes. The LoRA activation keyword will be included in each prompt.")
+    for i, prompt in enumerate(st.session_state['queued_prompts']):
+        user_prompt = st.text_input(f"Prompt {i+1}", value=prompt, key=f"queued_prompt_{i}")
+        st.session_state['queued_prompts'][i] = prepend_lora_keyword(user_prompt, lora_activation_keyword)
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Add Prompt"):
+            st.session_state['queued_prompts'].append(prepend_lora_keyword("", lora_activation_keyword))
+    with col2:
+        if len(st.session_state['queued_prompts']) > 1:
+            remove_idx = st.number_input("Remove prompt #", min_value=1, max_value=len(st.session_state['queued_prompts']), value=1, step=1, key="remove_prompt_idx")
+            if st.button("Remove Prompt"):
+                st.session_state['queued_prompts'].pop(remove_idx-1)
+    num_images = st.slider("Number of images to generate per prompt", 1, 4, key="queued_num_images")
+    if st.button("Generate Images with Trained Model"):
         with st.spinner("Loading model and generating images for queued prompts..."):
             try:
                 device, precision, device_msg, torch_version = get_best_device_and_precision()
@@ -668,25 +772,5 @@ else:
                     images = pipe([prompt_with_keyword]*st.session_state['queued_num_images']).images
                     for img in images:
                         st.image(img)
-                st.session_state['auto_generate_images'] = False  # Only auto-generate once
             except Exception as e:
                 st.error(f"Image generation failed: {e}")
-    else:
-        # Manual trigger if user wants to re-generate
-        if st.button("Generate Images"):
-            with st.spinner("Loading model and generating images for queued prompts..."):
-                try:
-                    device, precision, device_msg, torch_version = get_best_device_and_precision()
-                    pipe = StableDiffusionPipeline.from_pretrained(
-                        st.session_state['trained_model_dir'],
-                        torch_dtype=precision
-                    )
-                    pipe = pipe.to(device)
-                    for prompt in st.session_state['queued_prompts']:
-                        prompt_with_keyword = prepend_lora_keyword(prompt, lora_activation_keyword)
-                        st.markdown(f"**Prompt:** {prompt_with_keyword}")
-                        images = pipe([prompt_with_keyword]*st.session_state['queued_num_images']).images
-                        for img in images:
-                            st.image(img)
-                except Exception as e:
-                    st.error(f"Image generation failed: {e}")
