@@ -10,7 +10,7 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 from clip_interrogator import Config, Interrogator
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 from diffusers.training_utils import EMAModel
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig
 import threading
 import time
 from huggingface_hub import hf_hub_download
@@ -115,52 +115,109 @@ def search_hf_models(query, hf_token):
     else:
         return []
 
+def detect_model_type(model_id, hf_token=None):
+    """
+    Detect model type using config/class inspection if possible, fallback to string heuristic.
+    Returns: 'diffusion', 'transformer', or 'unknown'
+    """
+    try:
+        from huggingface_hub import model_info
+        info = model_info(model_id, token=hf_token)
+        # Check tags in model card
+        tags = info.tags if hasattr(info, 'tags') else []
+        if any(t in tags for t in ["stable-diffusion", "diffusers", "sdxl", "unet"]):
+            return "diffusion"
+        if any(t in tags for t in ["causal-lm", "text-generation", "transformers", "bert", "gpt", "llama", "bloom", "t5", "roberta", "deberta"]):
+            return "transformer"
+        # Try to load config and check class
+        try:
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(model_id, use_auth_token=hf_token)
+            if hasattr(config, 'architectures'):
+                archs = [a.lower() for a in config.architectures or []]
+                if any(x in archs for x in ["unet", "diffusion"]):
+                    return "diffusion"
+                if any(x in archs for x in ["causallm", "gpt", "bert", "llama", "bloom", "t5", "roberta", "deberta"]):
+                    return "transformer"
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Fallback to string heuristic
+    model_id_lower = model_id.lower() if model_id else ""
+    if any(x in model_id_lower for x in ["stable-diffusion", "sdxl", "sd-turbo", "unet"]):
+        return "diffusion"
+    if any(x in model_id_lower for x in ["bert", "gpt", "llama", "bloom", "t5", "roberta", "deberta", "gpt2", "gpt-neo", "gpt-j", "gpt3", "gpt4", "opt", "falcon", "mistral"]):
+        return "transformer"
+    return "unknown"
+
 def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
-    progress_bar = st.progress(0, text="Loading base model...")
+    model_type = detect_model_type(base_model_id, hf_token)
+    progress_bar = st.progress(0, text=f"Loading base model ({model_type})...")
     for i in range(1, 6):
         time.sleep(0.2)
         progress_bar.progress(i * 15, text=f"Loading base model... ({i*15}%)")
     try:
-        pipe = StableDiffusionPipeline.from_pretrained(
-            base_model_id,
-            use_auth_token=hf_token,
-            torch_dtype=precision if precision is not None else (torch.float16 if device in ["cuda", "npu"] else torch.float32),
-            safety_checker=None,
-            scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
-        )
-        progress_bar.progress(90, text="Finalizing model...")
-        pipe = pipe.to(device)
-        progress_bar.progress(100, text="Model loaded!")
+        tried_types = []
+        def try_diffusion():
+            tried_types.append("diffusion")
+            pipe = StableDiffusionPipeline.from_pretrained(
+                base_model_id,
+                use_auth_token=hf_token,
+                torch_dtype=precision if precision is not None else (torch.float16 if device in ["cuda", "npu"] else torch.float32),
+                safety_checker=None,
+                scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+            )
+            progress_bar.progress(90, text="Finalizing model...")
+            pipe = pipe.to(device)
+            progress_bar.progress(100, text="Model loaded!")
+            st.warning("LoRA training for diffusion models is not yet implemented. Only model loading is performed.")
+            pipe.save_pretrained(output_dir)
+            return "diffusion"
+        def try_transformer():
+            tried_types.append("transformer")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from peft import LoraConfig, get_peft_model
+            model = AutoModelForCausalLM.from_pretrained(base_model_id, use_auth_token=hf_token)
+            tokenizer = AutoTokenizer.from_pretrained(base_model_id, use_auth_token=hf_token)
+            lora_config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                target_modules=["q_proj", "v_proj"],
+                lora_dropout=0.1,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            lora_model = get_peft_model(model, lora_config)
+            st.warning("LoRA training for text models is not yet implemented. Only model loading is performed.")
+            lora_model.save_pretrained(output_dir)
+            return "transformer"
+        # Main logic
+        if model_type == "diffusion":
+            try:
+                return try_diffusion()
+            except Exception as e:
+                st.warning(f"Diffusion model loading failed: {e}")
+                model_type = "unknown"  # fallback
+        if model_type == "transformer":
+            try:
+                return try_transformer()
+            except Exception as e:
+                st.warning(f"Transformer model loading failed: {e}")
+                model_type = "unknown"  # fallback
+        if model_type == "unknown":
+            # Try both, in order
+            try:
+                return try_diffusion()
+            except Exception as e1:
+                st.info(f"Tried diffusion method, failed: {e1}")
+                try:
+                    return try_transformer()
+                except Exception as e2:
+                    st.error(f"Could not load model as diffusion or transformer.\nDiffusion error: {e1}\nTransformer error: {e2}")
+                    return None
     finally:
         progress_bar.empty()
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["attn1", "attn2"],
-        lora_dropout=0.1,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    pipe.unet = get_peft_model(pipe.unet, lora_config)
-    # Prepare dataset (images, captions)
-    # Use adv_config for batch size, learning rate, epochs, optimizer
-    if adv_config:
-        batch_size = adv_config.get("batch_size", 4)
-        learning_rate = adv_config.get("learning_rate", 1e-4)
-        epochs = adv_config.get("epochs", 10)
-        optimizer = adv_config.get("optimizer", "AdamW")
-    else:
-        batch_size, learning_rate, epochs, optimizer = 4, 1e-4, 10, "AdamW"
-    # Optionally execute custom_code (highly advanced)
-    if custom_code and custom_code.strip():
-        try:
-            exec(custom_code, globals())
-        except Exception as e:
-            st.warning(f"Custom config/code error: {e}")
-    # ... (implement a PyTorch dataset for your images/captions, use batch_size, learning_rate, epochs, optimizer)
-    # Train LoRA (implement a training loop or use diffusers' LoRATrainer)
-    # Save LoRA weights
-    pipe.unet.save_pretrained(output_dir)
     return output_dir
 
 def upload_model_to_hf(model_dir, hf_token, base_name, user_name):
