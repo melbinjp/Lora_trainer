@@ -151,6 +151,22 @@ def detect_model_type(model_id, hf_token=None):
         return "transformer"
     return "unknown"
 
+with st.expander("4. Advanced Training Settings", expanded=False):
+    batch_size = st.number_input("Batch Size", min_value=1, max_value=128, value=4)
+    learning_rate = st.number_input("Learning Rate", min_value=1e-6, max_value=1e-2, value=1e-4, format="%e")
+    epochs = st.number_input("Epochs", min_value=1, max_value=100, value=10)
+    optimizer = st.selectbox("Optimizer", ["AdamW", "SGD"], index=0)
+    lora_rank = st.number_input("LoRA Rank (smaller = less memory, default 2)", min_value=1, max_value=128, value=2)
+    lora_alpha = st.number_input("LoRA Alpha (default 2)", min_value=1, max_value=128, value=2)
+    adv_config = {
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "epochs": epochs,
+        "optimizer": optimizer,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha
+    }
+
 def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
     """
     Robust LoRA training for diffusion/image models using diffusers native LoRA support.
@@ -242,8 +258,10 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
             scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
         )
         pipe = pipe.to(device)
-        # Enable LoRA training (diffusers >=0.20)
-        pipe.enable_lora()
+        # Enable LoRA training (diffusers >=0.20) with user-specified rank/alpha
+        lora_rank = adv_config["lora_rank"] if adv_config and "lora_rank" in adv_config else 2
+        lora_alpha = adv_config["lora_alpha"] if adv_config and "lora_alpha" in adv_config else 2
+        pipe.enable_lora(r=lora_rank, alpha=lora_alpha)
     except Exception as e:
         st.error(f"Failed to load base model: {e}")
         shutil.rmtree(temp_dir)
@@ -251,36 +269,46 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
 
     # --- Prepare dataset and dataloader ---
     dataset = ImageCaptionDataset(img_paths, captions, image_size=config['image_size'])
-    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
 
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(pipe.unet.parameters(), lr=config['learning_rate'])
 
-    # --- Training loop ---
+    # --- Training loop with OOM handling and auto batch size reduction ---
     st.info(f"Starting LoRA training for {config['epochs']} epochs...")
     global_step = 0
-    # Get pipeline dtype for correct casting
     pipe_dtype = pipe.unet.dtype if hasattr(pipe.unet, 'dtype') else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32)
-    for epoch in range(config['epochs']):
+    batch_size = config['batch_size']
+    min_batch_size = 1
+    epoch = 0
+    while epoch < config['epochs']:
         running_loss = 0.0
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        step = 0
+        oom_in_epoch = False
         for step, (images_batch, captions_batch) in enumerate(dataloader):
             with accelerator.accumulate(pipe.unet):
-                # Move images to device and correct dtype
                 images_batch = images_batch.to(device=device, dtype=pipe_dtype)
                 prompts = list(captions_batch)
                 try:
-                    # VAE encode expects correct dtype
                     latents = pipe.vae.encode(images_batch).latent_dist.sample().to(device=device, dtype=pipe_dtype)
                     latents = latents * pipe.vae.config.scaling_factor
                     noise = torch.randn_like(latents, device=device, dtype=pipe_dtype)
                     timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (images_batch.shape[0],), device=device).long()
                     noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
-                    # Tokenizer/text encoder expects input_ids on device
                     input_ids = pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt").input_ids.to(device)
                     encoder_hidden_states = pipe.text_encoder(input_ids)[0]
                     model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states).sample
                     target = noise
                     loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        st.warning(f"CUDA out of memory at batch size {batch_size}. Reducing batch size and retrying...")
+                        torch.cuda.empty_cache()
+                        oom_in_epoch = True
+                        break
+                    else:
+                        st.error(f"Training step failed: {e}")
+                        continue
                 except Exception as e:
                     st.error(f"Training step failed: {e}")
                     continue
@@ -293,8 +321,20 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
                 global_step += 1
                 if step % 2 == 0:
                     st.info(f"Epoch {epoch+1}/{config['epochs']}, Step {step+1}, Loss: {loss.item():.4f}")
-        avg_loss = running_loss / (step+1)
+        if oom_in_epoch:
+            if batch_size > min_batch_size:
+                batch_size = max(min_batch_size, batch_size // 2)
+                st.warning(f"Retrying epoch {epoch+1} with reduced batch size: {batch_size}")
+                torch.cuda.empty_cache()
+                continue  # retry this epoch
+            else:
+                st.error("CUDA out of memory even at batch size 1. Cannot continue training. Try reducing image size or using a smaller model.")
+                shutil.rmtree(temp_dir)
+                return None
+        avg_loss = running_loss / (step+1) if (step+1) > 0 else float('nan')
         st.info(f"Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
+        epoch += 1
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # --- Check LoRA layers are present ---
     if not hasattr(pipe, 'lora_layers') or not pipe.lora_layers:
@@ -585,28 +625,6 @@ with st.expander("Show/Change Model (Advanced)", expanded=False):
         # Example: Check for large models
         if vram_gb and ('xl' in custom_model_id.lower() or 'sdxl' in custom_model_id.lower()) and vram_gb < 12:
             st.warning(f"Warning: {custom_model_id} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
-        # If user enters a custom model, require token
-        if not hf_token_global:
-            st.error("A Hugging Face token is required for custom/private models.")
-
-# --- Step 4: Advanced Training Settings ---
-with st.expander("4. Advanced Training Settings", expanded=False):
-    batch_size = st.number_input("Batch Size", min_value=1, max_value=128, value=4)
-    learning_rate = st.number_input("Learning Rate", min_value=1e-6, max_value=1e-2, value=1e-4, format="%e")
-    epochs = st.number_input("Epochs", min_value=1, max_value=100, value=10)
-    optimizer = st.selectbox("Optimizer", ["AdamW", "SGD"], index=0)
-    adv_config = {
-        "batch_size": batch_size,
-        "learning_rate": learning_rate,
-        "epochs": epochs,
-        "optimizer": optimizer
-    }
-
-# --- Step 6: LoRA Metadata ---
-st.subheader("6. LoRA Metadata")
-lora_model_name = st.text_input("LoRA Model Name (required)", value="my_lora")
-lora_activation_keyword = st.text_input("Activation Keyword (required)", value="my_lora_keyword")
-hf_repo_name = st.text_input("Hugging Face Repo Name (required, will be created if not exists)", value=f"lora-{lora_model_name}")
 
 # --- Step 7: Start LoRA Training ---
 # Ensure custom_code is always defined
