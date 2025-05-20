@@ -435,7 +435,10 @@ st.subheader("6. LoRA Metadata")
 lora_model_name = st.text_input("LoRA Model Name (required)", value="my_lora")
 lora_activation_keyword = st.text_input("Activation Keyword (required)", value="my_lora_keyword")
 
-# --- Step 7: Start Training ---
+# --- Step 7: Start LoRA Training ---
+# Ensure custom_code is always defined
+if 'custom_code' not in locals():
+    custom_code = ""
 if st.button("Start LoRA Training"):
     # Auto-generate captions/tags if in automatic mode and not already generated
     if caption_mode == "Automatic (Recommended)":
@@ -457,16 +460,17 @@ if st.button("Start LoRA Training"):
                         tag_hf_id if tag_source == "Hugging Face (repo ID)" else None,
                         tag_local_file if tag_source == "Local Upload (.zip)" else None
                     )
-                for idx, cap in enumerate(gen_captions):
-                    st.session_state[f"caption_{idx}"] = cap
-                st.session_state['auto_captions'] = gen_captions
-                st.success("Captions/Tags generated!")
-                # Rerun with compatibility
-                if hasattr(st, "rerun"):
-                    st.rerun()
+                # Only update auto_captions and rerun, let widget pick up new value
+                if gen_captions and len(gen_captions) == len(images):
+                    st.session_state['auto_captions'] = gen_captions
+                    if hasattr(st, "rerun"):
+                        st.rerun()
+                    else:
+                        st.experimental_rerun()
                 else:
-                    st.experimental_rerun()
+                    st.error("Auto-captioning/tagging did not return captions for all images. Please try again.")
             except Exception as e:
+                st.session_state.pop('auto_captions', None)
                 st.error(f"Auto-captioning/tagging failed: {e}")
                 st.stop()
     # Validate all images have captions/tags
