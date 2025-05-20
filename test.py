@@ -261,12 +261,13 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         # Enable LoRA training (diffusers >=0.20) with user-specified rank/alpha
         lora_rank = adv_config["lora_rank"] if adv_config and "lora_rank" in adv_config else 2
         lora_alpha = adv_config["lora_alpha"] if adv_config and "lora_alpha" in adv_config else 2
-        # Use add_lora if available, else fallback to enable_lora()
+        # Use add_adapter if available, else fallback to enable_lora()
         try:
-            if hasattr(pipe, "add_lora"):
-                pipe.add_lora(rank=lora_rank, alpha=lora_alpha)
-            elif hasattr(pipe, "add_adapter"):
+            if hasattr(pipe, "add_adapter"):
                 pipe.add_adapter("lora", rank=lora_rank, alpha=lora_alpha)
+                pipe.set_adapters("lora")
+            elif hasattr(pipe, "add_lora"):
+                pipe.add_lora(rank=lora_rank, alpha=lora_alpha)
             else:
                 pipe.enable_lora()  # Use default config if custom not supported
         except Exception as e:
@@ -277,6 +278,19 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
                 st.error(f"Failed to enable LoRA: {e2}")
                 shutil.rmtree(temp_dir)
                 return None
+        # Set unet to train mode
+        if hasattr(pipe, "unet"):
+            pipe.unet.train()
+        # Check LoRA layers exist after adapter setup
+        if not (hasattr(pipe, "lora_layers") and pipe.lora_layers):
+            st.error("No LoRA layers found after adapter setup. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
+            shutil.rmtree(temp_dir)
+            return None
+        # Only optimize LoRA parameters
+        if hasattr(pipe, "get_trainable_parameters"):
+            optimizer = torch.optim.AdamW(pipe.get_trainable_parameters(), lr=config['learning_rate'])
+        else:
+            optimizer = torch.optim.AdamW(pipe.unet.parameters(), lr=config['learning_rate'])
     except Exception as e:
         st.error(f"Failed to load base model: {e}")
         shutil.rmtree(temp_dir)
@@ -284,9 +298,6 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
 
     # --- Prepare dataset and dataloader ---
     dataset = ImageCaptionDataset(img_paths, captions, image_size=config['image_size'])
-
-    # --- Optimizer ---
-    optimizer = torch.optim.AdamW(pipe.unet.parameters(), lr=config['learning_rate'])
 
     # --- Training loop with OOM handling and auto batch size reduction ---
     st.info(f"Starting LoRA training for {config['epochs']} epochs...")
