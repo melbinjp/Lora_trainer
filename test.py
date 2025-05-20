@@ -153,27 +153,21 @@ def detect_model_type(model_id, hf_token=None):
 
 def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
     """
-    Robust LoRA training for diffusion/image models using diffusers and peft.
-    Features:
-    - Handles image/caption dataset with transforms and error handling
-    - Uses accelerate for device/mixed precision
-    - Configurable batch size, epochs, learning rate, optimizer
-    - Progress reporting to Streamlit
-    - Saves LoRA weights in standard format
-    - Supports custom config/code (advanced)
-    - Cleans up temp files
+    Robust LoRA training for diffusion/image models using diffusers native LoRA support.
+    - No PEFT/transformer code is used.
+    - Uses diffusers' built-in LoRA hooks for image models.
+    - Handles dataset, error handling, config, and cleanup.
     """
     import torch
     import os
     import shutil
     import tempfile
     import gc
+    import numpy as np
     from torch.utils.data import Dataset, DataLoader
     from PIL import Image
     from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
-    from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
     from accelerate import Accelerator
-    import traceback
     import time
 
     # --- Model type check ---
@@ -218,7 +212,6 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         'batch_size': 4,
         'learning_rate': 1e-4,
         'epochs': 10,
-        'optimizer': 'AdamW',
         'image_size': 512,
         'gradient_accumulation_steps': 1,
         'max_grad_norm': 1.0,
@@ -228,7 +221,6 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
     }
     if adv_config:
         config.update(adv_config)
-    # Allow custom_code to override config (advanced)
     if custom_code:
         try:
             exec(custom_code, {}, {'custom_config': config})
@@ -239,7 +231,7 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
     accelerator = Accelerator(mixed_precision=config['mixed_precision'])
     device = accelerator.device
 
-    # --- Load pipeline and prepare LoRA ---
+    # --- Load pipeline and enable LoRA ---
     st.info(f"Loading base model: {base_model_id}")
     try:
         pipe = StableDiffusionPipeline.from_pretrained(
@@ -250,30 +242,19 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
             scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
         )
         pipe = pipe.to(device)
+        # Enable LoRA training (diffusers >=0.20)
+        pipe.enable_lora()
     except Exception as e:
         st.error(f"Failed to load base model: {e}")
         shutil.rmtree(temp_dir)
         return None
-
-    # --- Prepare LoRA config ---
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.1,
-        bias="none",
-        task_type="UNET"
-    )
-    pipe.unet = get_peft_model(pipe.unet, lora_config)
-    pipe.unet.train()
 
     # --- Prepare dataset and dataloader ---
     dataset = ImageCaptionDataset(img_paths, captions, image_size=config['image_size'])
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
 
     # --- Optimizer ---
-    optimizer_cls = torch.optim.AdamW if config['optimizer'].lower() == 'adamw' else torch.optim.SGD
-    optimizer = optimizer_cls(pipe.unet.parameters(), lr=config['learning_rate'])
+    optimizer = torch.optim.AdamW(pipe.unet.parameters(), lr=config['learning_rate'])
 
     # --- Training loop ---
     st.info(f"Starting LoRA training for {config['epochs']} epochs...")
@@ -283,9 +264,7 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         for step, (images_batch, captions_batch) in enumerate(dataloader):
             with accelerator.accumulate(pipe.unet):
                 images_batch = images_batch.to(device)
-                # Use captions as prompts
                 prompts = list(captions_batch)
-                # Forward pass
                 try:
                     latents = pipe.vae.encode(images_batch).latent_dist.sample()
                     latents = latents * pipe.vae.config.scaling_factor
@@ -311,13 +290,11 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         avg_loss = running_loss / (step+1)
         st.info(f"Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
 
-    # --- Save LoRA weights ---
+    # --- Save LoRA weights using diffusers API ---
     st.info("Saving LoRA weights...")
     try:
-        lora_save_path = os.path.join(output_dir, f"{lora_model_name}_lora.safetensors")
-        state_dict = pipe.unet.state_dict()
-        torch.save(state_dict, lora_save_path)
-        st.success(f"LoRA training complete! Weights saved to {lora_save_path}")
+        pipe.save_lora_weights(output_dir)
+        st.success(f"LoRA training complete! Weights saved to {output_dir}")
     except Exception as e:
         st.error(f"Failed to save LoRA weights: {e}")
         shutil.rmtree(temp_dir)
