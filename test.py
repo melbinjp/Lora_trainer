@@ -116,17 +116,23 @@ def search_hf_models(query, hf_token):
         return []
 
 def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
-    pipe = download_with_progress(
-        base_model_id,
-        "Stable Diffusion base model for LoRA training.",
-        StableDiffusionPipeline.from_pretrained,
-        base_model_id,
-        use_auth_token=hf_token,
-        torch_dtype=precision if precision is not None else (torch.float16 if device in ["cuda", "npu"] else torch.float32),
-        safety_checker=None,
-        scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
-    )
-    pipe = pipe.to(device)
+    progress_bar = st.progress(0, text="Loading base model...")
+    for i in range(1, 6):
+        time.sleep(0.2)
+        progress_bar.progress(i * 15, text=f"Loading base model... ({i*15}%)")
+    try:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            base_model_id,
+            use_auth_token=hf_token,
+            torch_dtype=precision if precision is not None else (torch.float16 if device in ["cuda", "npu"] else torch.float32),
+            safety_checker=None,
+            scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+        )
+        progress_bar.progress(90, text="Finalizing model...")
+        pipe = pipe.to(device)
+        progress_bar.progress(100, text="Model loaded!")
+    finally:
+        progress_bar.empty()
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
