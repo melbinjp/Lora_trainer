@@ -313,7 +313,7 @@ if images:
         with st.container():
             st.image(img, width=200, caption=img.name)
             st.text_area(
-                f"{'Caption' if caption_type == "Caption (Sentence)" else 'Tags'} for {img.name}",
+                f"{'Caption' if caption_type == 'Caption (Sentence)' else 'Tags'} for {img.name}",
                 value=st.session_state.get(f"caption_{idx}", ""),
                 key=f"caption_{idx}"
             )

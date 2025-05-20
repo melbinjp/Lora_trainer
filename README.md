@@ -24,7 +24,24 @@
 ## Google Colab (One-click)
 
 1. Open `colab_quickstart.ipynb` in Colab.
-2. Run all cells. The UI will be available via a public link.
+2. Run all cells. The UI will be available via a public link (look for the `trycloudflare.com` URL in the output).
+3. (Optional) For persistent tunnels, see the Cloudflared Auth section below.
+
+### Hugging Face Token (for private/custom models)
+- Go to https://huggingface.co/settings/tokens
+- Click "New token" (read access is enough)
+- Copy the token and paste it into the Hugging Face Token field in the Streamlit sidebar (left side of the UI).
+
+### Public Link via Cloudflared (Colab)
+- The Colab notebook automatically installs and runs Cloudflared to create a public link.
+- The public URL will be printed in the Colab output (look for `https://...trycloudflare.com`).
+- No account or login is required for basic use.
+
+#### (Optional) Persistent Cloudflared Tunnel
+- For advanced users who want a persistent, custom subdomain:
+  1. Sign up at https://dash.cloudflare.com/ and add a site (free tier is fine).
+  2. Follow the Cloudflared docs: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/
+  3. Authenticate with `cloudflared tunnel login` (not needed for basic Colab use).
 
 ## Cloud VM (AWS, GCP, etc.)
 
