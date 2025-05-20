@@ -281,9 +281,14 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         # Set unet to train mode
         if hasattr(pipe, "unet"):
             pipe.unet.train()
-        # Check LoRA layers exist after adapter setup
-        if not (hasattr(pipe, "lora_layers") and pipe.lora_layers):
-            st.error("No LoRA layers found after adapter setup. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
+        # Check LoRA adapter presence after setup (diffusers >=0.22)
+        adapter_ok = False
+        if hasattr(pipe, "adapters") and "lora" in getattr(pipe, "adapters", {}):
+            adapter_ok = True
+        elif hasattr(pipe, "get_active_adapters") and "lora" in pipe.get_active_adapters():
+            adapter_ok = True
+        if not adapter_ok:
+            st.error(f"No LoRA adapter named 'lora' found after setup. Adapters present: {getattr(pipe, 'adapters', None)}. Active: {pipe.get_active_adapters() if hasattr(pipe, 'get_active_adapters') else None}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
             shutil.rmtree(temp_dir)
             return None
         # Only optimize LoRA parameters
