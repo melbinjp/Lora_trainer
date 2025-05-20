@@ -261,7 +261,22 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         # Enable LoRA training (diffusers >=0.20) with user-specified rank/alpha
         lora_rank = adv_config["lora_rank"] if adv_config and "lora_rank" in adv_config else 2
         lora_alpha = adv_config["lora_alpha"] if adv_config and "lora_alpha" in adv_config else 2
-        pipe.enable_lora(r=lora_rank, alpha=lora_alpha)
+        # Use add_lora if available, else fallback to enable_lora()
+        try:
+            if hasattr(pipe, "add_lora"):
+                pipe.add_lora(rank=lora_rank, alpha=lora_alpha)
+            elif hasattr(pipe, "add_adapter"):
+                pipe.add_adapter("lora", rank=lora_rank, alpha=lora_alpha)
+            else:
+                pipe.enable_lora()  # Use default config if custom not supported
+        except Exception as e:
+            st.warning(f"Could not set custom LoRA rank/alpha: {e}. Using default LoRA config.")
+            try:
+                pipe.enable_lora()
+            except Exception as e2:
+                st.error(f"Failed to enable LoRA: {e2}")
+                shutil.rmtree(temp_dir)
+                return None
     except Exception as e:
         st.error(f"Failed to load base model: {e}")
         shutil.rmtree(temp_dir)
