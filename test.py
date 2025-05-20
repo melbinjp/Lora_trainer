@@ -37,29 +37,35 @@ DEFAULT_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
 # --- Caching for Model Files Only (not full model objects) ---
 @st.cache_resource(show_spinner=False)
-def get_blip_model_files(hf_token):
-    processor = BlipProcessor.from_pretrained(
-        DEFAULT_CAPTION_MODEL,
-        use_auth_token=hf_token
-    )
-    model = BlipForConditionalGeneration.from_pretrained(
-        DEFAULT_CAPTION_MODEL,
-        use_auth_token=hf_token
-    )
+def get_blip_model_files(hf_token, blip_model_id, local_path=None):
+    if local_path and os.path.exists(local_path):
+        processor = BlipProcessor.from_pretrained(local_path)
+        model = BlipForConditionalGeneration.from_pretrained(local_path)
+    else:
+        processor = BlipProcessor.from_pretrained(
+            blip_model_id,
+            use_auth_token=hf_token
+        )
+        model = BlipForConditionalGeneration.from_pretrained(
+            blip_model_id,
+            use_auth_token=hf_token
+        )
     return processor, model
 
 @st.cache_resource(show_spinner=False)
-def get_clip_interrogator_files():
-    ci = Interrogator(Config(clip_model_name="ViT-L-14/openai"))
+def get_clip_interrogator_files(clip_model_id, local_path=None):
+    if local_path and os.path.exists(local_path):
+        ci = Interrogator(Config(clip_model_name=local_path))
+    else:
+        ci = Interrogator(Config(clip_model_name=clip_model_id))
     return ci
 
 # --- Updated Caption/Tag Generation Functions with Progress Bar ---
-def generate_captions_for_images(images, hf_token):
-    st.info(f"Loading BLIP model for captioning...")
+def generate_captions_for_images(images, hf_token, blip_model_id, local_blip_path=None):
+    st.info(f"Loading BLIP model for captioning: {blip_model_id if not local_blip_path else local_blip_path}")
     progress_bar = st.progress(0)
-    processor, model = get_blip_model_files(hf_token)
+    processor, model = get_blip_model_files(hf_token, blip_model_id, local_blip_path)
     progress_bar.progress(50)
-    # Simulate model instantiation/loading (if needed)
     time.sleep(0.2)
     progress_bar.progress(100)
     captions = []
@@ -72,12 +78,11 @@ def generate_captions_for_images(images, hf_token):
     progress_bar.empty()
     return captions
 
-def generate_tags_for_images(images):
-    st.info(f"Loading CLIP Interrogator for tagging...")
+def generate_tags_for_images(images, clip_model_id, local_clip_path=None):
+    st.info(f"Loading CLIP Interrogator for tagging: {clip_model_id if not local_clip_path else local_clip_path}")
     progress_bar = st.progress(0)
-    ci = get_clip_interrogator_files()
+    ci = get_clip_interrogator_files(clip_model_id, local_clip_path)
     progress_bar.progress(50)
-    # Simulate model instantiation/loading (if needed)
     time.sleep(0.2)
     progress_bar.progress(100)
     tags = []
@@ -259,6 +264,71 @@ st.subheader("2. Captioning")
 caption_mode = st.radio("How do you want to provide captions/tags?", ("Automatic (Recommended)", "Manual"), index=0)
 caption_type = st.radio("Captioning/Tagging Mode", ["Caption (Sentence)", "Tags (Keywords)"], index=0)
 
+# --- Model Source Selection (Unified Dropdowns) ---
+def model_source_dropdown(label, default_hf_id, local_key, cloud_key_prefix):
+    source = st.selectbox(
+        f"{label} Model Source",
+        ["Hugging Face (repo ID)", "Local Upload (.zip)", "Cloud Storage (Drive/S3/etc.)"],
+        key=f"{cloud_key_prefix}_source"
+    )
+    model_id = default_hf_id
+    local_file = None
+    cloud_provider = None
+    cloud_path = None
+    cloud_auth = None
+    if source == "Hugging Face (repo ID)":
+        model_id = st.text_input(f"Hugging Face repo ID for {label} model", value=default_hf_id, key=f"{cloud_key_prefix}_hf_id")
+    elif source == "Local Upload (.zip)":
+        local_file = st.file_uploader(f"Upload local {label} model folder as .zip", type=["zip"], key=f"{local_key}_zip")
+    elif source == "Cloud Storage (Drive/S3/etc.)":
+        cloud_provider = st.selectbox(f"Cloud Provider for {label} model", ["Google Drive", "OneDrive", "AWS S3", "Azure Blob", "GCP Storage"], key=f"{cloud_key_prefix}_provider")
+        # Show mounting instructions dynamically
+        if cloud_provider == "Google Drive":
+            st.info("To use Google Drive, run the mounting script or, in Colab, run:\n\nfrom google.colab import drive\ndrive.mount('/content/drive')\n\nThen enter the path to your model (e.g., /content/drive/MyDrive/my_model_dir).")
+        elif cloud_provider == "OneDrive":
+            st.info("To use OneDrive, run the mounting script or use rclone to mount your OneDrive remote. Then enter the mount path (e.g., /content/onedrive/my_model_dir). See README for details.")
+        elif cloud_provider == "AWS S3":
+            st.info("To use AWS S3, run the mounting script or use rclone to mount your S3 bucket. Then enter the mount path (e.g., /content/s3bucket/my_model_dir). See README for details.")
+        elif cloud_provider == "Azure Blob":
+            st.info("To use Azure Blob, run the mounting script or use rclone to mount your Azure remote. Then enter the mount path (e.g., /content/azure/my_model_dir). See README for details.")
+        elif cloud_provider == "GCP Storage":
+            st.info("To use Google Cloud Storage, run the mounting script or use rclone to mount your GCS bucket. Then enter the mount path (e.g., /content/gcs/my_model_dir). See README for details.")
+        cloud_path = st.text_input(f"Path to {label} model in cloud storage (mounted path)", key=f"{cloud_key_prefix}_path")
+        if cloud_provider in ["AWS S3", "Azure Blob", "GCP Storage"]:
+            cloud_auth = st.text_area(f"Auth/config for {cloud_provider} (if needed)", key=f"{cloud_key_prefix}_auth")
+    return source, model_id, local_file, cloud_provider, cloud_path, cloud_auth
+
+with st.expander("Advanced Model Selection", expanded=False):
+    st.markdown("#### Captioning Model")
+    cap_source, cap_hf_id, cap_local_file, cap_cloud_provider, cap_cloud_path, cap_cloud_auth = model_source_dropdown(
+        "Captioning (BLIP)", "Salesforce/blip-image-captioning-base", "local_blip", "cap_blip"
+    )
+    st.markdown("#### Tagging Model")
+    tag_source, tag_hf_id, tag_local_file, tag_cloud_provider, tag_cloud_path, tag_cloud_auth = model_source_dropdown(
+        "Tagging (CLIP)", "ViT-L-14/openai", "local_clip", "tag_clip"
+    )
+    st.markdown("#### Base Model")
+    base_source, base_hf_id, base_local_file, base_cloud_provider, base_cloud_path, base_cloud_auth = model_source_dropdown(
+        "Base", DEFAULT_BASE_MODEL["modelId"], "local_base", "base"
+    )
+    st.markdown("#### LoRA Model (optional, for reuse)")
+    lora_source, lora_hf_id, lora_local_file, lora_cloud_provider, lora_cloud_path, lora_cloud_auth = model_source_dropdown(
+        "LoRA", "", "local_lora", "lora"
+    )
+    # --- Highly Advanced (show with checkbox, not expander) ---
+    show_highly_advanced = st.checkbox("Show Highly Advanced Options", value=False)
+    if show_highly_advanced:
+        default_code = (
+            "# Example: Custom training config as Python dict\n"
+            "custom_config = {\n"
+            "    'batch_size': 4,\n"
+            "    'learning_rate': 1e-4,\n"
+            "    'epochs': 10,\n"
+            "    'optimizer': 'AdamW'\n"
+            "}\n"
+        )
+        custom_code = st.text_area("Edit training config/code (Python)", value=default_code, height=180)
+
 if images:
     # Always show images in the UI
     st.write("### Uploaded Images")
@@ -273,10 +343,16 @@ if images:
                     if caption_type == "Caption (Sentence)":
                         gen_captions = generate_captions_for_images(
                             images,
-                            hf_token_global
+                            hf_token_global,
+                            cap_hf_id if cap_source == "Hugging Face (repo ID)" else None,
+                            cap_local_file if cap_source == "Local Upload (.zip)" else None
                         )
                     else:
-                        gen_captions = generate_tags_for_images(images)
+                        gen_captions = generate_tags_for_images(
+                            images,
+                            tag_hf_id if tag_source == "Hugging Face (repo ID)" else None,
+                            tag_local_file if tag_source == "Local Upload (.zip)" else None
+                        )
                     # Only set session state if all captions are generated successfully
                     if gen_captions and len(gen_captions) == len(images):
                         for idx, cap in enumerate(gen_captions):
@@ -354,19 +430,6 @@ with st.expander("4. Advanced Training Settings", expanded=False):
         "optimizer": optimizer
     }
 
-# --- Step 5: Highly Advanced: Edit Training Config/Code ---
-default_code = (
-    "# Example: Custom training config as Python dict\n"
-    "custom_config = {\n"
-    "    'batch_size': 4,\n"
-    "    'learning_rate': 1e-4,\n"
-    "    'epochs': 10,\n"
-    "    'optimizer': 'AdamW'\n"
-    "}\n"
-)
-with st.expander("5. Highly Advanced: Edit Training Config/Code", expanded=False):
-    custom_code = st.text_area("Edit training config/code (Python)", value=default_code, height=180)
-
 # --- Step 6: LoRA Metadata ---
 st.subheader("6. LoRA Metadata")
 lora_model_name = st.text_input("LoRA Model Name (required)", value="my_lora")
@@ -384,10 +447,16 @@ if st.button("Start LoRA Training"):
                 if caption_type == "Caption (Sentence)":
                     gen_captions = generate_captions_for_images(
                         images,
-                        hf_token_global
+                        hf_token_global,
+                        cap_hf_id if cap_source == "Hugging Face (repo ID)" else None,
+                        cap_local_file if cap_source == "Local Upload (.zip)" else None
                     )
                 else:
-                    gen_captions = generate_tags_for_images(images)
+                    gen_captions = generate_tags_for_images(
+                        images,
+                        tag_hf_id if tag_source == "Hugging Face (repo ID)" else None,
+                        tag_local_file if tag_source == "Local Upload (.zip)" else None
+                    )
                 for idx, cap in enumerate(gen_captions):
                     st.session_state[f"caption_{idx}"] = cap
                 st.session_state['auto_captions'] = gen_captions
@@ -416,7 +485,7 @@ if st.button("Start LoRA Training"):
         train_lora(
             images,
             captions,
-            DEFAULT_BASE_MODEL["modelId"],
+            base_hf_id if base_source == "Hugging Face (repo ID)" else None,
             lora_model_name,
             lora_activation_keyword,
             output_dir,
@@ -501,7 +570,7 @@ with col2:
         if st.button("Remove Prompt"):
             st.session_state['queued_prompts'].pop(remove_idx-1)
 
-num_images = st.slider("Number of images to generate per prompt", 1, 4, st.session_state['queued_num_images'], key="queued_num_images")
+num_images = st.slider("Number of images to generate per prompt", 1, 4, key="queued_num_images")
 
 # If model is not ready, show info
 if not st.session_state.get('model_ready', False):
