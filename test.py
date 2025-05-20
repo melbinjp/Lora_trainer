@@ -35,44 +35,27 @@ DEFAULT_LORA_METHOD = {
 }
 DEFAULT_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# --- Progress bar utility for model downloads ---
-def download_with_progress(model_id, description, download_fn, *args, **kwargs):
-    """
-    Download a model with a Streamlit progress bar and details.
-    model_id: str, description: str, download_fn: callable, *args: args for download_fn
-    Returns the downloaded object.
-    """
-    st.info(f"Downloading model: {model_id}\n\n{description}")
-    progress_bar = st.progress(0)
-    # Simulate progress for demonstration; replace with real progress if possible
-    for percent in range(0, 100, 10):
-        progress_bar.progress(percent)
-        time.sleep(0.1)
-    # Actual download
-    obj = download_fn(*args, **kwargs)
-    progress_bar.progress(100)
-    st.success(f"Downloaded: {model_id}")
-    return obj
+# --- Caching for Captioning/Tagging Models ---
+@st.cache_resource(show_spinner=False)
+def get_blip_model(hf_token):
+    processor = BlipProcessor.from_pretrained(
+        DEFAULT_CAPTION_MODEL,
+        use_auth_token=hf_token
+    )
+    model = BlipForConditionalGeneration.from_pretrained(
+        DEFAULT_CAPTION_MODEL,
+        use_auth_token=hf_token
+    )
+    return processor, model
 
-def generate_captions_for_images(images, model_name, hf_token):
-    """
-    Generate captions for a list of images using BLIP.
-    Returns a list of captions (one per image).
-    """
-    processor = download_with_progress(
-        model_name,
-        "BLIP Processor for image captioning.",
-        BlipProcessor.from_pretrained,
-        model_name,
-        use_auth_token=hf_token
-    )
-    model = download_with_progress(
-        model_name,
-        "BLIP Model for image captioning.",
-        BlipForConditionalGeneration.from_pretrained,
-        model_name,
-        use_auth_token=hf_token
-    )
+@st.cache_resource(show_spinner=False)
+def get_clip_interrogator():
+    ci = Interrogator(Config(clip_model_name="ViT-L-14/openai"))
+    return ci
+
+# --- Updated Caption/Tag Generation Functions ---
+def generate_captions_for_images(images, hf_token):
+    processor, model = get_blip_model(hf_token)
     captions = []
     for img_file in images:
         image = Image.open(img_file).convert('RGB')
@@ -82,16 +65,8 @@ def generate_captions_for_images(images, model_name, hf_token):
         captions.append(caption)
     return captions
 
-def generate_tags_for_images(images, hf_token):
-    """
-    Generate tags for a list of images using CLIP Interrogator.
-    Returns a list of tags (one per image).
-    """
-    ci = download_with_progress(
-        "ViT-L-14/openai",
-        "CLIP Interrogator (ViT-L-14) for image tagging.",
-        lambda: Interrogator(Config(clip_model_name="ViT-L-14/openai"))
-    )
+def generate_tags_for_images(images):
+    ci = get_clip_interrogator()
     tags = []
     for img_file in images:
         image = Image.open(img_file).convert('RGB')
@@ -277,24 +252,27 @@ if images:
     auto_captions = st.session_state.get('auto_captions', None)
     captions_ready = auto_captions is not None and len(auto_captions) == len(images)
     if caption_mode == "Automatic (Recommended)":
-        st.info(f"Using BLIP model: `{DEFAULT_CAPTION_MODEL}` for automatic captioning.")
+        st.info(f"Using {'BLIP' if caption_type == 'Caption (Sentence)' else 'CLIP Interrogator'} model for automatic {caption_type.lower()}.")
         if st.button("Auto Caption/Tag All Images"):
             with st.spinner("Downloading captioning/tagging model and generating captions/tags for all images..."):
                 try:
                     if caption_type == "Caption (Sentence)":
                         gen_captions = generate_captions_for_images(
                             images,
-                            DEFAULT_CAPTION_MODEL,
                             hf_token_global
                         )
                     else:
-                        gen_captions = generate_tags_for_images(images, hf_token_global)
+                        gen_captions = generate_tags_for_images(images)
                     # Only set session state if all captions are generated successfully
                     if gen_captions and len(gen_captions) == len(images):
                         for idx, cap in enumerate(gen_captions):
                             st.session_state[f"caption_{idx}"] = cap
                         st.session_state['auto_captions'] = gen_captions
-                        st.experimental_rerun()
+                        # Rerun with compatibility
+                        if hasattr(st, "rerun"):
+                            st.rerun()
+                        else:
+                            st.experimental_rerun()
                     else:
                         st.error("Auto-captioning/tagging did not return captions for all images. Please try again.")
                 except Exception as e:
@@ -392,16 +370,19 @@ if st.button("Start LoRA Training"):
                 if caption_type == "Caption (Sentence)":
                     gen_captions = generate_captions_for_images(
                         images,
-                        DEFAULT_CAPTION_MODEL,
                         hf_token_global
                     )
                 else:
-                    gen_captions = generate_tags_for_images(images, hf_token_global)
+                    gen_captions = generate_tags_for_images(images)
                 for idx, cap in enumerate(gen_captions):
                     st.session_state[f"caption_{idx}"] = cap
                 st.session_state['auto_captions'] = gen_captions
                 st.success("Captions/Tags generated!")
-                st.experimental_rerun()
+                # Rerun with compatibility
+                if hasattr(st, "rerun"):
+                    st.rerun()
+                else:
+                    st.experimental_rerun()
             except Exception as e:
                 st.error(f"Auto-captioning/tagging failed: {e}")
                 st.stop()
