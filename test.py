@@ -280,7 +280,9 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         # 2. Warn if batch size is too high for VRAM
-        if hasattr(torch, 'cuda') and torch.cuda.is_available() and batch_size > 4 and torch.cuda.get_device_properties(0).total_memory < 8 * 1024 ** 3:
+        # Use config['batch_size'] instead of batch_size (which may not be defined yet)
+        effective_batch_size = config.get('batch_size', 4)
+        if hasattr(torch, 'cuda') and torch.cuda.is_available() and effective_batch_size > 4 and torch.cuda.get_device_properties(0).total_memory < 8 * 1024 ** 3:
             st.warning("Batch size > 4 on low VRAM GPU may cause OOM. Reduce batch size or use gradient accumulation.")
         # 3. Enable LoRA adapter and set as active
         try:
