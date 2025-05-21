@@ -158,13 +158,27 @@ with st.expander("4. Advanced Training Settings", expanded=False):
     optimizer = st.selectbox("Optimizer", ["AdamW", "SGD"], index=0)
     lora_rank = st.number_input("LoRA Rank (smaller = less memory, default 2)", min_value=1, max_value=128, value=2)
     lora_alpha = st.number_input("LoRA Alpha (default 2)", min_value=1, max_value=128, value=2)
+    # --- New: Expose LoRA adapter name, adapter weights, and allow multiple adapters ---
+    lora_adapter_name = st.text_input("LoRA Adapter Name (default: 'lora')", value="lora")
+    enable_multi_adapter = st.checkbox("Enable Multiple Adapters (set_adapters)", value=False)
+    adapter_names = [lora_adapter_name]
+    adapter_weights = [1.0]
+    if enable_multi_adapter:
+        adapter_names = st.text_area("Adapter Names (comma-separated)", value=lora_adapter_name).split(",")
+        adapter_weights = st.text_area("Adapter Weights (comma-separated, same order)", value=",".join(["1.0"]*len(adapter_names))).split(",")
+        adapter_names = [n.strip() for n in adapter_names if n.strip()]
+        adapter_weights = [float(w.strip()) for w in adapter_weights if w.strip()]
     adv_config = {
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "epochs": epochs,
         "optimizer": optimizer,
         "lora_rank": lora_rank,
-        "lora_alpha": lora_alpha
+        "lora_alpha": lora_alpha,
+        "lora_adapter_name": lora_adapter_name,
+        "adapter_names": adapter_names,
+        "adapter_weights": adapter_weights,
+        "enable_multi_adapter": enable_multi_adapter
     }
 
 def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
@@ -258,7 +272,7 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
             scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
         )
         pipe = pipe.to(device)
-        # --- Best practices for LoRA training setup ---
+        # --- Best practices for LoRA training setup (diffusers >=0.22) ---
         # 1. Set random seed for reproducibility
         seed = 42
         torch.manual_seed(seed)
@@ -271,8 +285,11 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         # 3. Enable LoRA adapter and set as active
         try:
             if hasattr(pipe, "add_adapter"):
-                pipe.add_adapter("lora", rank=lora_rank, alpha=lora_alpha)
-                pipe.set_adapters("lora")
+                pipe.add_adapter(adv_config.get("lora_adapter_name", "lora"), rank=lora_rank, alpha=lora_alpha)
+                if adv_config.get("enable_multi_adapter") and len(adv_config["adapter_names"]) > 1:
+                    pipe.set_adapters(adv_config["adapter_names"], adv_config["adapter_weights"])
+                else:
+                    pipe.set_adapters(adv_config.get("lora_adapter_name", "lora"))
             elif hasattr(pipe, "add_lora"):
                 pipe.add_lora(rank=lora_rank, alpha=lora_alpha)
             else:
@@ -291,10 +308,10 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         # 5. Freeze all non-LoRA parameters (only train LoRA)
         if hasattr(pipe, "unet") and hasattr(pipe, "get_trainable_parameters"):
             for n, p in pipe.unet.named_parameters():
-                if not p.requires_grad:
-                    continue
                 if "lora" not in n:
                     p.requires_grad = False
+                else:
+                    p.requires_grad = True
         # 6. Check LoRA adapter presence after setup (diffusers >=0.22)
         adapter_ok = False
         if hasattr(pipe, "adapters") and "lora" in getattr(pipe, "adapters", {}):
@@ -307,10 +324,19 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
             return None
         # 7. Use only LoRA parameters for optimizer
         if hasattr(pipe, "get_trainable_parameters"):
-            optimizer = torch.optim.AdamW(pipe.get_trainable_parameters(), lr=config['learning_rate'])
+            trainable_params = list(pipe.get_trainable_parameters())
+            if not trainable_params:
+                st.error("No trainable LoRA parameters found. Training cannot proceed.")
+                shutil.rmtree(temp_dir)
+                return None
+            optimizer = torch.optim.AdamW(trainable_params, lr=config['learning_rate'])
         else:
             # Fallback: try to filter LoRA params manually
             lora_params = [p for n, p in pipe.unet.named_parameters() if p.requires_grad and "lora" in n]
+            if not lora_params:
+                st.error("No trainable LoRA parameters found. Training cannot proceed.")
+                shutil.rmtree(temp_dir)
+                return None
             optimizer = torch.optim.AdamW(lora_params, lr=config['learning_rate'])
         # 8. Use mixed precision on GPU for best performance
         if device.type == "cuda" and config['mixed_precision'] != 'fp16':
@@ -392,7 +418,7 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # --- Check LoRA layers are present ---
-    if not hasattr(pipe, 'lora_layers') or not pipe.lora_layers:
+    if not hasattr(pipe, 'adapters') or "lora" not in pipe.adapters:
         st.error("No LoRA layers found in the pipeline. Training did not modify any LoRA weights.")
         shutil.rmtree(temp_dir)
         return None
@@ -400,7 +426,10 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
     # --- Save LoRA weights using diffusers API ---
     st.info("Saving LoRA weights...")
     try:
-        pipe.save_lora_weights(output_dir)
+        if hasattr(pipe, "save_adapter"):
+            pipe.save_adapter(output_dir, adapter_name="lora")
+        else:
+            pipe.save_lora_weights(output_dir)
         st.success(f"LoRA training complete! Weights saved to {output_dir}")
     except Exception as e:
         st.error(f"Failed to save LoRA weights: {e}")
