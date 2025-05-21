@@ -258,10 +258,17 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
             scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
         )
         pipe = pipe.to(device)
-        # Enable LoRA training (diffusers >=0.20) with user-specified rank/alpha
-        lora_rank = adv_config["lora_rank"] if adv_config and "lora_rank" in adv_config else 2
-        lora_alpha = adv_config["lora_alpha"] if adv_config and "lora_alpha" in adv_config else 2
-        # Use add_adapter if available, else fallback to enable_lora()
+        # --- Best practices for LoRA training setup ---
+        # 1. Set random seed for reproducibility
+        seed = 42
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        # 2. Warn if batch size is too high for VRAM
+        if hasattr(torch, 'cuda') and torch.cuda.is_available() and batch_size > 4 and torch.cuda.get_device_properties(0).total_memory < 8 * 1024 ** 3:
+            st.warning("Batch size > 4 on low VRAM GPU may cause OOM. Reduce batch size or use gradient accumulation.")
+        # 3. Enable LoRA adapter and set as active
         try:
             if hasattr(pipe, "add_adapter"):
                 pipe.add_adapter("lora", rank=lora_rank, alpha=lora_alpha)
@@ -278,10 +285,17 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
                 st.error(f"Failed to enable LoRA: {e2}")
                 shutil.rmtree(temp_dir)
                 return None
-        # Set unet to train mode
+        # 4. Set unet to train mode
         if hasattr(pipe, "unet"):
             pipe.unet.train()
-        # Check LoRA adapter presence after setup (diffusers >=0.22)
+        # 5. Freeze all non-LoRA parameters (only train LoRA)
+        if hasattr(pipe, "unet") and hasattr(pipe, "get_trainable_parameters"):
+            for n, p in pipe.unet.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if "lora" not in n:
+                    p.requires_grad = False
+        # 6. Check LoRA adapter presence after setup (diffusers >=0.22)
         adapter_ok = False
         if hasattr(pipe, "adapters") and "lora" in getattr(pipe, "adapters", {}):
             adapter_ok = True
@@ -291,11 +305,21 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
             st.error(f"No LoRA adapter named 'lora' found after setup. Adapters present: {getattr(pipe, 'adapters', None)}. Active: {pipe.get_active_adapters() if hasattr(pipe, 'get_active_adapters') else None}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
             shutil.rmtree(temp_dir)
             return None
-        # Only optimize LoRA parameters
+        # 7. Use only LoRA parameters for optimizer
         if hasattr(pipe, "get_trainable_parameters"):
             optimizer = torch.optim.AdamW(pipe.get_trainable_parameters(), lr=config['learning_rate'])
         else:
-            optimizer = torch.optim.AdamW(pipe.unet.parameters(), lr=config['learning_rate'])
+            # Fallback: try to filter LoRA params manually
+            lora_params = [p for n, p in pipe.unet.named_parameters() if p.requires_grad and "lora" in n]
+            optimizer = torch.optim.AdamW(lora_params, lr=config['learning_rate'])
+        # 8. Use mixed precision on GPU for best performance
+        if device.type == "cuda" and config['mixed_precision'] != 'fp16':
+            config['mixed_precision'] = 'fp16'
+            accelerator = Accelerator(mixed_precision='fp16')
+            device = accelerator.device
+        # 9. Use gradient accumulation for small VRAM
+        if config['batch_size'] == 1:
+            config['gradient_accumulation_steps'] = 4
     except Exception as e:
         st.error(f"Failed to load base model: {e}")
         shutil.rmtree(temp_dir)
