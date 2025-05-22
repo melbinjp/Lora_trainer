@@ -285,25 +285,36 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         if hasattr(torch, 'cuda') and torch.cuda.is_available() and effective_batch_size > 4 and torch.cuda.get_device_properties(0).total_memory < 8 * 1024 ** 3:
             st.warning("Batch size > 4 on low VRAM GPU may cause OOM. Reduce batch size or use gradient accumulation.")
         # 3. Enable LoRA adapter and set as active
+        import diffusers
+        st.info(f"diffusers version: {diffusers.__version__}, model class: {type(pipe).__name__}")
+        adapter_setup_success = False
+        adapter_error_msgs = []
+        # Try add_adapter first
         try:
             if hasattr(pipe, "add_adapter"):
                 pipe.add_adapter(adv_config.get("lora_adapter_name", "lora"), rank=lora_rank, alpha=lora_alpha)
-                if adv_config.get("enable_multi_adapter") and len(adv_config["adapter_names"]) > 1:
-                    pipe.set_adapters(adv_config["adapter_names"], adv_config["adapter_weights"])
-                else:
-                    pipe.set_adapters(adv_config.get("lora_adapter_name", "lora"))
-            elif hasattr(pipe, "add_lora"):
-                pipe.add_lora(rank=lora_rank, alpha=lora_alpha)
+                adapter_setup_success = True
+                st.info(f"add_adapter succeeded. Adapters: {getattr(pipe, 'adapters', None)}")
             else:
-                pipe.enable_lora()  # Use default config if custom not supported
+                adapter_error_msgs.append("Pipeline does not have add_adapter().")
         except Exception as e:
-            st.warning(f"Could not set custom LoRA rank/alpha: {e}. Using default LoRA config.")
+            adapter_error_msgs.append(f"add_adapter failed: {e}")
+        # If not, try enable_lora
+        if not adapter_setup_success:
             try:
-                pipe.enable_lora()
-            except Exception as e2:
-                st.error(f"Failed to enable LoRA: {e2}")
-                shutil.rmtree(temp_dir)
-                return None
+                if hasattr(pipe, "enable_lora"):
+                    pipe.enable_lora()
+                    adapter_setup_success = True
+                    st.info(f"enable_lora succeeded. Adapters: {getattr(pipe, 'adapters', None)}")
+                else:
+                    adapter_error_msgs.append("Pipeline does not have enable_lora().")
+            except Exception as e:
+                adapter_error_msgs.append(f"enable_lora failed: {e}")
+        # If still not, abort early
+        if not adapter_setup_success:
+            st.error(f"This model or diffusers version does not support native LoRA adapters.\nModel: {base_model_id}\nClass: {type(pipe).__name__}\ndiffusers: {diffusers.__version__}\nAdapter errors: {' | '.join(adapter_error_msgs)}\nPlease use a supported Stable Diffusion model (e.g., runwayml/stable-diffusion-v1-5) and diffusers >=0.22.0.")
+            shutil.rmtree(temp_dir)
+            return None
         # 4. Set unet to train mode
         if hasattr(pipe, "unet"):
             pipe.unet.train()
