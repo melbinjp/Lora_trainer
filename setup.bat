@@ -31,7 +31,7 @@ if errorlevel 1 (
 )
 
 REM Suggest device-specific optimizations
-python -c "import torch; print('[INFO] CUDA:', torch.cuda.is_available()); print('[INFO] MPS:', getattr(torch, 'has_mps', False))"
+python -c "import torch; print('[INFO] CUDA:', torch.cuda.is_available()); print('[INFO] MPS:', getattr(torch.backends.mps, 'is_built', lambda: False)())"
 
 ECHO [SUCCESS] Setup complete! To run:
 ECHO   streamlit run test.py
