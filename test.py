@@ -615,9 +615,16 @@ def get_best_device_and_precision():
 
 # --- Sidebar: Hugging Face Token (Optional for default model) ---
 import os
-colab_hf_token = os.environ.get('HF_TOKEN', None)
-if colab_hf_token:
-    st.sidebar.info('Hugging Face token loaded from Colab secret (HF_TOKEN). You can override below if needed.')
+colab_hf_token = None
+try:
+    colab_hf_token = os.environ.get('HF_TOKEN', None)
+    if colab_hf_token:
+        st.sidebar.success('Hugging Face token extracted from environment successfully (HF_TOKEN).')
+    else:
+        st.sidebar.info('No Hugging Face token found in environment. You can enter it below.')
+except Exception as e:
+    st.sidebar.warning(f'Error checking environment for Hugging Face token: {e}')
+
 hf_token_global = st.sidebar.text_input(
     "Hugging Face Token",
     type="password",
@@ -996,4 +1003,3 @@ if st.session_state.get('model_ready', False):
                         st.image(img)
             except Exception as e:
                 st.error(f"Image generation failed: {e}")
-```
