@@ -315,13 +315,23 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
                 else:
                     p.requires_grad = True
         # 6. Check LoRA adapter presence after setup (diffusers >=0.22)
+        # Use the actual adapter name(s) from adv_config, not hardcoded 'lora'
+        adapter_names_to_check = adv_config.get("adapter_names", [adv_config.get("lora_adapter_name", "lora")])
+        adapters_present = getattr(pipe, 'adapters', None)
+        active_adapters = pipe.get_active_adapters() if hasattr(pipe, 'get_active_adapters') else []
         adapter_ok = False
-        if hasattr(pipe, "adapters") and "lora" in getattr(pipe, "adapters", {}):
-            adapter_ok = True
-        elif hasattr(pipe, "get_active_adapters") and "lora" in pipe.get_active_adapters():
-            adapter_ok = True
+        if adapters_present:
+            for name in adapter_names_to_check:
+                if name in adapters_present:
+                    adapter_ok = True
+                    break
+        if not adapter_ok and active_adapters:
+            for name in adapter_names_to_check:
+                if name in active_adapters:
+                    adapter_ok = True
+                    break
         if not adapter_ok:
-            st.error(f"No LoRA adapter named 'lora' found after setup. Adapters present: {getattr(pipe, 'adapters', None)}. Active: {pipe.get_active_adapters() if hasattr(pipe, 'get_active_adapters') else None}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
+            st.error(f"No LoRA adapter(s) named {adapter_names_to_check} found after setup. Adapters present: {adapters_present}. Active: {active_adapters}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
             shutil.rmtree(temp_dir)
             return None
         # 7. Use only LoRA parameters for optimizer
@@ -356,15 +366,37 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
     # --- Prepare dataset and dataloader ---
     dataset = ImageCaptionDataset(img_paths, captions, image_size=config['image_size'])
 
-    # --- Training loop with OOM handling and auto batch size reduction ---
+    # --- Training loop with OOM handling, auto batch size and image size reduction, and CPU fallback ---
     st.info(f"Starting LoRA training for {config['epochs']} epochs...")
     global_step = 0
     pipe_dtype = pipe.unet.dtype if hasattr(pipe.unet, 'dtype') else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32)
     batch_size = config['batch_size']
     min_batch_size = 1
     epoch = 0
+    orig_image_size = config['image_size']
+    min_image_size = 128
+    fallback_attempted = False
+    cpu_fallback_attempted = False
+    def validate_images(img_paths, image_size):
+        valid_imgs, valid_caps = [], []
+        for i, img_path in enumerate(img_paths):
+            try:
+                img = Image.open(img_path).convert('RGB')
+                img = img.resize((image_size, image_size), Image.BICUBIC)
+                _ = torch.from_numpy(np.array(img)).permute(2,0,1).float() / 255.0
+                valid_imgs.append(img_path)
+                valid_caps.append(captions[i])
+            except Exception as e:
+                st.warning(f"Image {img_path} could not be loaded or resized: {e}. Skipping.")
+        return valid_imgs, valid_caps
+    img_paths_valid, captions_valid = validate_images(img_paths, config['image_size'])
+    if not img_paths_valid:
+        st.error("No valid images found for training after validation. Aborting.")
+        shutil.rmtree(temp_dir)
+        return None
     while epoch < config['epochs']:
         running_loss = 0.0
+        dataset = ImageCaptionDataset(img_paths_valid, captions_valid, image_size=config['image_size'])
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         step = 0
         oom_in_epoch = False
@@ -410,8 +442,28 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
                 st.warning(f"Retrying epoch {epoch+1} with reduced batch size: {batch_size}")
                 torch.cuda.empty_cache()
                 continue  # retry this epoch
+            elif config['image_size'] > min_image_size and not fallback_attempted:
+                config['image_size'] = max(min_image_size, config['image_size'] // 2)
+                st.warning(f"OOM at batch size 1. Reducing image size to {config['image_size']} and retrying epoch {epoch+1}.")
+                img_paths_valid, captions_valid = validate_images(img_paths, config['image_size'])
+                if not img_paths_valid:
+                    st.error("No valid images after reducing image size. Aborting.")
+                    shutil.rmtree(temp_dir)
+                    return None
+                fallback_attempted = True
+                torch.cuda.empty_cache()
+                continue
+            elif device.type != "cpu" and not cpu_fallback_attempted:
+                st.warning("OOM at minimum batch size and image size. Falling back to CPU and retrying epoch.")
+                import torch as torch2
+                device = torch2.device("cpu")
+                accelerator = Accelerator(mixed_precision="no")
+                pipe = pipe.to(device)
+                cpu_fallback_attempted = True
+                torch2.cuda.empty_cache()
+                continue
             else:
-                st.error("CUDA out of memory even at batch size 1. Cannot continue training. Try reducing image size or using a smaller model.")
+                st.error("Out of memory even at minimum batch size and image size, and CPU fallback failed. Cannot continue training. Try using smaller images or a smaller model.")
                 shutil.rmtree(temp_dir)
                 return None
         avg_loss = running_loss / (step+1) if (step+1) > 0 else float('nan')
@@ -419,17 +471,26 @@ def train_lora(images, captions, base_model_id, lora_model_name, lora_activation
         epoch += 1
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # --- Check LoRA layers are present ---
-    if not hasattr(pipe, 'adapters') or "lora" not in pipe.adapters:
-        st.error("No LoRA layers found in the pipeline. Training did not modify any LoRA weights.")
+    # --- Check LoRA layers are present robustly ---
+    adapters_present = getattr(pipe, 'adapters', None)
+    adapter_names_to_check = adv_config.get("adapter_names", [adv_config.get("lora_adapter_name", "lora")])
+    adapter_ok = False
+    if adapters_present:
+        for name in adapter_names_to_check:
+            if name in adapters_present:
+                adapter_ok = True
+                break
+    if not adapter_ok:
+        st.error(f"No LoRA adapter(s) named {adapter_names_to_check} found after training. Adapters present: {adapters_present}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
         shutil.rmtree(temp_dir)
         return None
 
-    # --- Save LoRA weights using diffusers API ---
+    # --- Save LoRA weights using diffusers API robustly ---
     st.info("Saving LoRA weights...")
     try:
         if hasattr(pipe, "save_adapter"):
-            pipe.save_adapter(output_dir, adapter_name="lora")
+            for name in adapter_names_to_check:
+                pipe.save_adapter(output_dir, adapter_name=name)
         else:
             pipe.save_lora_weights(output_dir)
         st.success(f"LoRA training complete! Weights saved to {output_dir}")
