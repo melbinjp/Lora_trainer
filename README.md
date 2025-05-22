@@ -69,6 +69,19 @@ python mount_cloud_storage.py
 - If you encounter errors, try re-running the setup script or manually installing the missing package.
 - For custom ports or public sharing, see Streamlit docs or add `--server.port=XXXX` to the run command.
 
+---
+
+## Dependency Management
+
+- This project uses `requirements.txt` for all dependencies.
+- To install dependencies locally or in Colab:
+  ```sh
+  pip install -r requirements.txt
+  ```
+- You do **not** need Poetry or pyproject.toml for normal use.
+
+---
+
 ## Troubleshooting & Best Practices
 
 ### Common Issues

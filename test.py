@@ -18,6 +18,42 @@ import os
 import random
 from datetime import datetime
 from huggingface_hub import HfApi
+import logging
+import traceback
+
+# --- Logging setup ---
+LOG_FILE = "lora_ui.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode="a",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
+)
+
+def clear_log_file():
+    with open(LOG_FILE, "w") as f:
+        f.truncate(0)
+
+def download_log_file():
+    with open(LOG_FILE, "rb") as f:
+        st.download_button("Download Log File", f, file_name=LOG_FILE)
+
+# Helper to log and show in Streamlit
+def log_info(msg):
+    logging.info(msg)
+    st.info(msg)
+
+def log_warning(msg):
+    logging.warning(msg)
+    st.warning(msg)
+
+def log_error(msg):
+    logging.error(msg)
+    st.error(msg)
+
+def log_exception(msg):
+    logging.exception(msg)
+    st.error(msg + "\n" + traceback.format_exc())
 
 # Try to import torch for GPU info, if available
 try:
@@ -62,7 +98,7 @@ def get_clip_interrogator_files(clip_model_id, local_path=None):
 
 # --- Updated Caption/Tag Generation Functions with Progress Bar ---
 def generate_captions_for_images(images, hf_token, blip_model_id, local_blip_path=None):
-    st.info(f"Loading BLIP model for captioning: {blip_model_id if not local_blip_path else local_blip_path}")
+    log_info(f"Loading BLIP model for captioning: {blip_model_id if not local_blip_path else local_blip_path}")
     progress_bar = st.progress(0)
     processor, model = get_blip_model_files(hf_token, blip_model_id, local_blip_path)
     progress_bar.progress(50)
@@ -79,7 +115,7 @@ def generate_captions_for_images(images, hf_token, blip_model_id, local_blip_pat
     return captions
 
 def generate_tags_for_images(images, clip_model_id, local_clip_path=None):
-    st.info(f"Loading CLIP Interrogator for tagging: {clip_model_id if not local_clip_path else local_clip_path}")
+    log_info(f"Loading CLIP Interrogator for tagging: {clip_model_id if not local_clip_path else local_clip_path}")
     progress_bar = st.progress(0)
     ci = get_clip_interrogator_files(clip_model_id, local_clip_path)
     progress_bar.progress(50)
@@ -181,449 +217,26 @@ with st.expander("4. Advanced Training Settings", expanded=False):
         "enable_multi_adapter": enable_multi_adapter
     }
 
-def train_lora(images, captions, base_model_id, lora_model_name, lora_activation_keyword, output_dir, hf_token, device, adv_config=None, custom_code=None, precision=None):
-    """
-    Robust LoRA training for diffusion/image models using diffusers native LoRA support.
-    - No PEFT/transformer code is used.
-    - Uses diffusers' built-in LoRA hooks for image models.
-    - Handles dataset, error handling, config, and cleanup.
-    """
-    import torch
-    import os
-    import shutil
-    import tempfile
-    import gc
-    import numpy as np
-    from torch.utils.data import Dataset, DataLoader
-    from PIL import Image
-    from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
-    from accelerate import Accelerator
-    import time
-
-    # --- Model type check ---
-    model_type = detect_model_type(base_model_id, hf_token)
-    if model_type != "diffusion":
-        st.error("Only image/diffusion models are supported for LoRA training. Please select a compatible model (e.g., Stable Diffusion, SDXL). Transformer/text models are not supported.")
-        return None
-
-    # --- Prepare output dir ---
-    os.makedirs(output_dir, exist_ok=True)
-
-    # --- Prepare dataset ---
-    class ImageCaptionDataset(Dataset):
-        def __init__(self, images, captions, image_size=512):
-            self.images = images
-            self.captions = captions
-            self.image_size = image_size
-        def __len__(self):
-            return len(self.images)
-        def __getitem__(self, idx):
-            img_path = self.images[idx]
-            caption = self.captions[idx]
-            image = Image.open(img_path).convert('RGB')
-            image = image.resize((self.image_size, self.image_size), Image.BICUBIC)
-            image = torch.from_numpy(np.array(image)).permute(2,0,1).float() / 255.0
-            return image, caption
-
-    # --- Save uploaded images to temp files if needed ---
-    temp_dir = tempfile.mkdtemp()
-    img_paths = []
-    for i, img in enumerate(images):
-        if hasattr(img, 'read'):
-            img_path = os.path.join(temp_dir, f"temp_img_{i}.png")
-            with open(img_path, "wb") as f:
-                f.write(img.read())
-            img_paths.append(img_path)
-        else:
-            img_paths.append(img)
-
-    # --- Training config ---
-    config = {
-        'batch_size': 4,
-        'learning_rate': 1e-4,
-        'epochs': 10,
-        'image_size': 512,
-        'gradient_accumulation_steps': 1,
-        'max_grad_norm': 1.0,
-        'save_steps': 0,  # Only save at end
-        'resume_from_checkpoint': False,
-        'mixed_precision': 'fp16' if precision == torch.float16 else 'no',
-    }
-    if adv_config:
-        config.update(adv_config)
-    if custom_code:
-        try:
-            exec(custom_code, {}, {'custom_config': config})
-        except Exception as e:
-            st.warning(f"Custom config code error: {e}")
-
-    # --- Accelerator setup ---
-    accelerator = Accelerator(mixed_precision=config['mixed_precision'])
-    device = accelerator.device
-
-    # --- Load pipeline and enable LoRA ---
-    st.info(f"Loading base model: {base_model_id}")
-    try:
-        pipe = StableDiffusionPipeline.from_pretrained(
-            base_model_id,
-            use_auth_token=hf_token,
-            torch_dtype=precision if precision is not None else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32),
-            safety_checker=None,
-            scheduler=DPMSolverMultistepScheduler.from_pretrained(base_model_id, subfolder="scheduler")
-        )
-        pipe = pipe.to(device)
-        # --- Best practices for LoRA training setup (diffusers >=0.22) ---
-        # 1. Set random seed for reproducibility
-        seed = 42
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        # 2. Warn if batch size is too high for VRAM
-        # Use config['batch_size'] instead of batch_size (which may not be defined yet)
-        effective_batch_size = config.get('batch_size', 4)
-        if hasattr(torch, 'cuda') and torch.cuda.is_available() and effective_batch_size > 4 and torch.cuda.get_device_properties(0).total_memory < 8 * 1024 ** 3:
-            st.warning("Batch size > 4 on low VRAM GPU may cause OOM. Reduce batch size or use gradient accumulation.")
-        # 3. Enable LoRA adapter and set as active
-        import diffusers
-        st.info(f"diffusers version: {diffusers.__version__}, model class: {type(pipe).__name__}")
-        adapter_setup_success = False
-        adapter_error_msgs = []
-        # Try add_adapter first
-        try:
-            if hasattr(pipe, "add_adapter"):
-                pipe.add_adapter(adv_config.get("lora_adapter_name", "lora"), rank=lora_rank, alpha=lora_alpha)
-                adapter_setup_success = True
-                st.info(f"add_adapter succeeded. Adapters: {getattr(pipe, 'adapters', None)}")
-            else:
-                adapter_error_msgs.append("Pipeline does not have add_adapter().")
-        except Exception as e:
-            adapter_error_msgs.append(f"add_adapter failed: {e}")
-        # If not, try enable_lora
-        if not adapter_setup_success:
-            try:
-                if hasattr(pipe, "enable_lora"):
-                    pipe.enable_lora()
-                    adapter_setup_success = True
-                    st.info(f"enable_lora succeeded. Adapters: {getattr(pipe, 'adapters', None)}")
-                else:
-                    adapter_error_msgs.append("Pipeline does not have enable_lora().")
-            except Exception as e:
-                adapter_error_msgs.append(f"enable_lora failed: {e}")
-        # Log all adapter-related attributes for debugging
-        st.info(f"Adapter debug info:\n- type(pipe): {type(pipe)}\n- dir(pipe): {[a for a in dir(pipe) if 'adapter' in a or 'lora' in a]}\n- adapters: {getattr(pipe, 'adapters', None)}\n- get_active_adapters: {getattr(pipe, 'get_active_adapters', None)}\n- unet class: {getattr(pipe, 'unet', None).__class__ if hasattr(pipe, 'unet') else None}\n- text_encoder class: {getattr(pipe, 'text_encoder', None).__class__ if hasattr(pipe, 'text_encoder') else None}")
-        # Warn if model is not a known compatible base
-        known_good_models = [
-            "runwayml/stable-diffusion-v1-5",
-            "stabilityai/sd-turbo",
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            "stabilityai/stable-diffusion-2-1-base",
-            "stabilityai/stable-diffusion-2-base"
-        ]
-        if base_model_id not in known_good_models:
-            st.warning(f"Selected base model '{base_model_id}' is not a known compatible Stable Diffusion model. If LoRA setup fails, try using one of: {', '.join(known_good_models)}.")
-        # Try all known good models if adapter setup fails
-        if not adapter_setup_success:
-            tried_models = set([base_model_id])
-            for fallback_model in known_good_models:
-                if fallback_model in tried_models:
-                    continue
-                st.warning(f"LoRA adapter setup failed for '{base_model_id}'. Trying fallback model '{fallback_model}'...")
-                try:
-                    pipe = StableDiffusionPipeline.from_pretrained(
-                        fallback_model,
-                        use_auth_token=hf_token,
-                        torch_dtype=precision if precision is not None else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32),
-                        safety_checker=None,
-                        scheduler=DPMSolverMultistepScheduler.from_pretrained(fallback_model, subfolder="scheduler")
-                    )
-                    pipe = pipe.to(device)
-                    # Try add_adapter again
-                    adapter_error_msgs = []
-                    if hasattr(pipe, "add_adapter"):
-                        pipe.add_adapter(adv_config.get("lora_adapter_name", "lora"), rank=lora_rank, alpha=lora_alpha)
-                        adapter_setup_success = True
-                        st.info(f"add_adapter succeeded on fallback model. Adapters: {getattr(pipe, 'adapters', None)}")
-                    elif hasattr(pipe, "enable_lora"):
-                        pipe.enable_lora()
-                        adapter_setup_success = True
-                        st.info(f"enable_lora succeeded on fallback model. Adapters: {getattr(pipe, 'adapters', None)}")
-                    else:
-                        adapter_error_msgs.append("Fallback pipeline does not have add_adapter() or enable_lora().")
-                except Exception as e:
-                    adapter_error_msgs.append(f"Fallback model setup failed: {e}")
-                st.info(f"Adapter debug info (fallback):\n- type(pipe): {type(pipe)}\n- dir(pipe): {[a for a in dir(pipe) if 'adapter' in a or 'lora' in a]}\n- adapters: {getattr(pipe, 'adapters', None)}\n- get_active_adapters: {getattr(pipe, 'get_active_adapters', None)}\n- unet class: {getattr(pipe, 'unet', None).__class__ if hasattr(pipe, 'unet') else None}\n- text_encoder class: {getattr(pipe, 'text_encoder', None).__class__ if hasattr(pipe, 'text_encoder') else None}")
-                if adapter_setup_success:
-                    base_model_id = fallback_model
-                    break
-                tried_models.add(fallback_model)
-            if not adapter_setup_success:
-                st.error(f"All known good models failed for LoRA adapter setup.\nAdapter errors: {' | '.join(adapter_error_msgs)}\nPlease check your diffusers installation and environment.")
-                shutil.rmtree(temp_dir)
-                return None
-        # If still not, abort early
-        if not adapter_setup_success:
-            st.error(f"This model or diffusers version does not support native LoRA adapters.\nModel: {base_model_id}\nClass: {type(pipe).__name__}\ndiffusers: {diffusers.__version__}\nAdapter errors: {' | '.join(adapter_error_msgs)}\n\nAdapter debug info:\n- type(pipe): {type(pipe)}\n- dir(pipe): {[a for a in dir(pipe) if 'adapter' in a or 'lora' in a]}\n- adapters: {getattr(pipe, 'adapters', None)}\n- get_active_adapters: {getattr(pipe, 'get_active_adapters', None)}\n- unet class: {getattr(pipe, 'unet', None).__class__ if hasattr(pipe, 'unet') else None}\n- text_encoder class: {getattr(pipe, 'text_encoder', None).__class__ if hasattr(pipe, 'text_encoder') else None}\n\nPlease use a supported Stable Diffusion model (e.g., runwayml/stable-diffusion-v1-5) and diffusers >=0.22.0.\nIf you continue to see this error, switch to a known good model from the list above.")
-            shutil.rmtree(temp_dir)
-            return None
-        # 4. Set unet to train mode
-        if hasattr(pipe, "unet"):
-            pipe.unet.train()
-        # 5. Freeze all non-LoRA parameters (only train LoRA)
-        if hasattr(pipe, "unet") and hasattr(pipe, "get_trainable_parameters"):
-            for n, p in pipe.unet.named_parameters():
-                if "lora" not in n:
-                    p.requires_grad = False
-                else:
-                    p.requires_grad = True
-        # 6. Check LoRA adapter presence after setup (diffusers >=0.22)
-        # Use the actual adapter name(s) from adv_config, not hardcoded 'lora'
-        adapter_names_to_check = adv_config.get("adapter_names", [adv_config.get("lora_adapter_name", "lora")])
-        adapters_present = getattr(pipe, 'adapters', None)
-        active_adapters = pipe.get_active_adapters() if hasattr(pipe, 'get_active_adapters') else []
-        adapter_ok = False
-        if adapters_present:
-            for name in adapter_names_to_check:
-                if name in adapters_present:
-                    adapter_ok = True
-                    break
-        if not adapter_ok and active_adapters:
-            for name in adapter_names_to_check:
-                if name in active_adapters:
-                    adapter_ok = True
-                    break
-        if not adapter_ok:
-            st.error(f"No LoRA adapter(s) named {adapter_names_to_check} found after setup. Adapters present: {adapters_present}. Active: {active_adapters}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
-            shutil.rmtree(temp_dir)
-            return None
-        # 7. Use only LoRA parameters for optimizer
-        if hasattr(pipe, "get_trainable_parameters"):
-            trainable_params = list(pipe.get_trainable_parameters())
-            if not trainable_params:
-                st.error("No trainable LoRA parameters found. Training cannot proceed.")
-                shutil.rmtree(temp_dir)
-                return None
-            optimizer = torch.optim.AdamW(trainable_params, lr=config['learning_rate'])
-        else:
-            # Fallback: try to filter LoRA params manually
-            lora_params = [p for n, p in pipe.unet.named_parameters() if p.requires_grad and "lora" in n]
-            if not lora_params:
-                st.error("No trainable LoRA parameters found. Training cannot proceed.")
-                shutil.rmtree(temp_dir)
-                return None
-            optimizer = torch.optim.AdamW(lora_params, lr=config['learning_rate'])
-        # 8. Use mixed precision on GPU for best performance
-        if device.type == "cuda" and config['mixed_precision'] != 'fp16':
-            config['mixed_precision'] = 'fp16'
-            accelerator = Accelerator(mixed_precision='fp16')
-            device = accelerator.device
-        # 9. Use gradient accumulation for small VRAM
-        if config['batch_size'] == 1:
-            config['gradient_accumulation_steps'] = 4
-    except Exception as e:
-        st.error(f"Failed to load base model: {e}")
-        shutil.rmtree(temp_dir)
-        return None
-
-    # --- Prepare dataset and dataloader ---
-    dataset = ImageCaptionDataset(img_paths, captions, image_size=config['image_size'])
-
-    # --- Training loop with OOM handling, auto batch size and image size reduction, and CPU fallback ---
-    st.info(f"Starting LoRA training for {config['epochs']} epochs...")
-    global_step = 0
-    pipe_dtype = pipe.unet.dtype if hasattr(pipe.unet, 'dtype') else (torch.float16 if device.type in ["cuda", "npu"] else torch.float32)
-    batch_size = config['batch_size']
-    min_batch_size = 1
-    epoch = 0
-    orig_image_size = config['image_size']
-    min_image_size = 128
-    fallback_attempted = False
-    cpu_fallback_attempted = False
-    def validate_images(img_paths, image_size):
-        valid_imgs, valid_caps = [], []
-        for i, img_path in enumerate(img_paths):
-            try:
-                img = Image.open(img_path).convert('RGB')
-                img = img.resize((image_size, image_size), Image.BICUBIC)
-                _ = torch.from_numpy(np.array(img)).permute(2,0,1).float() / 255.0
-                valid_imgs.append(img_path)
-                valid_caps.append(captions[i])
-            except Exception as e:
-                st.warning(f"Image {img_path} could not be loaded or resized: {e}. Skipping.")
-        return valid_imgs, valid_caps
-    img_paths_valid, captions_valid = validate_images(img_paths, config['image_size'])
-    if not img_paths_valid:
-        st.error("No valid images found for training after validation. Aborting.")
-        shutil.rmtree(temp_dir)
-        return None
-    while epoch < config['epochs']:
-        running_loss = 0.0
-        dataset = ImageCaptionDataset(img_paths_valid, captions_valid, image_size=config['image_size'])
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-        step = 0
-        oom_in_epoch = False
-        for step, (images_batch, captions_batch) in enumerate(dataloader):
-            with accelerator.accumulate(pipe.unet):
-                images_batch = images_batch.to(device=device, dtype=pipe_dtype)
-                prompts = list(captions_batch)
-                try:
-                    latents = pipe.vae.encode(images_batch).latent_dist.sample().to(device=device, dtype=pipe_dtype)
-                    latents = latents * pipe.vae.config.scaling_factor
-                    noise = torch.randn_like(latents, device=device, dtype=pipe_dtype)
-                    timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (images_batch.shape[0],), device=device).long()
-                    noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
-                    input_ids = pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt").input_ids.to(device)
-                    encoder_hidden_states = pipe.text_encoder(input_ids)[0]
-                    model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                    target = noise
-                    loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        st.warning(f"CUDA out of memory at batch size {batch_size}. Reducing batch size and retrying...")
-                        torch.cuda.empty_cache()
-                        oom_in_epoch = True
-                        break
-                    else:
-                        st.error(f"Training step failed: {e}")
-                        continue
-                except Exception as e:
-                    st.error(f"Training step failed: {e}")
-                    continue
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config['max_grad_norm'])
-                optimizer.step()
-                optimizer.zero_grad()
-                running_loss += loss.item()
-                global_step += 1
-                if step % 2 == 0:
-                    st.info(f"Epoch {epoch+1}/{config['epochs']}, Step {step+1}, Loss: {loss.item():.4f}")
-        if oom_in_epoch:
-            if batch_size > min_batch_size:
-                batch_size = max(min_batch_size, batch_size // 2)
-                st.warning(f"Retrying epoch {epoch+1} with reduced batch size: {batch_size}")
-                torch.cuda.empty_cache()
-                continue  # retry this epoch
-            elif config['image_size'] > min_image_size and not fallback_attempted:
-                config['image_size'] = max(min_image_size, config['image_size'] // 2)
-                st.warning(f"OOM at batch size 1. Reducing image size to {config['image_size']} and retrying epoch {epoch+1}.")
-                img_paths_valid, captions_valid = validate_images(img_paths, config['image_size'])
-                if not img_paths_valid:
-                    st.error("No valid images after reducing image size. Aborting.")
-                    shutil.rmtree(temp_dir)
-                    return None
-                fallback_attempted = True
-                torch.cuda.empty_cache()
-                continue
-            elif device.type != "cpu" and not cpu_fallback_attempted:
-                st.warning("OOM at minimum batch size and image size. Falling back to CPU and retrying epoch.")
-                import torch as torch2
-                device = torch2.device("cpu")
-                accelerator = Accelerator(mixed_precision="no")
-                pipe = pipe.to(device)
-                cpu_fallback_attempted = True
-                torch2.cuda.empty_cache()
-                continue
-            else:
-                st.error("Out of memory even at minimum batch size and image size, and CPU fallback failed. Cannot continue training. Try using smaller images or a smaller model.")
-                shutil.rmtree(temp_dir)
-                return None
-        avg_loss = running_loss / (step+1) if (step+1) > 0 else float('nan')
-        st.info(f"Epoch {epoch+1} complete. Avg Loss: {avg_loss:.4f}")
-        epoch += 1
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    # --- Check LoRA layers are present robustly ---
-    adapters_present = getattr(pipe, 'adapters', None)
-    adapter_names_to_check = adv_config.get("adapter_names", [adv_config.get("lora_adapter_name", "lora")])
-    adapter_ok = False
-    if adapters_present:
-        for name in adapter_names_to_check:
-            if name in adapters_present:
-                adapter_ok = True
-                break
-    if not adapter_ok:
-        st.error(f"No LoRA adapter(s) named {adapter_names_to_check} found after training. Adapters present: {adapters_present}. Your diffusers version or model may not support native LoRA training. Please update diffusers or use a supported model.")
-        shutil.rmtree(temp_dir)
-        return None
-
-    # --- Save LoRA weights using diffusers API robustly ---
-    st.info("Saving LoRA weights...")
-    try:
-        if hasattr(pipe, "save_adapter"):
-            for name in adapter_names_to_check:
-                pipe.save_adapter(output_dir, adapter_name=name)
-        else:
-            pipe.save_lora_weights(output_dir)
-        st.success(f"LoRA training complete! Weights saved to {output_dir}")
-    except Exception as e:
-        st.error(f"Failed to save LoRA weights: {e}")
-        shutil.rmtree(temp_dir)
-        return None
-
-    # --- Clean up temp files ---
-    try:
-        shutil.rmtree(temp_dir)
-    except Exception:
-        pass
-    gc.collect()
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    return "trained"
-
-def upload_model_to_hf(model_dir, hf_token, base_name, user_name):
-    """
-    Uploads the model to Hugging Face Hub with a unique name (timestamp-based).
-    Returns the repo URL if successful.
-    """
-    api = HfApi()
-    unique_name = f"{base_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(1000,9999)}"
-    repo_id = f"{user_name}/{unique_name}"
-    api.create_repo(name=unique_name, exist_ok=True, token=hf_token)
-    api.upload_folder(
-        folder_path=model_dir,
-        repo_id=repo_id,
-        token=hf_token
-    )
-    return f"https://huggingface.co/{repo_id}"
-
-# --- Device selection: NPU/GPU/CPU/MPS/ROCm ---
-def get_best_device_and_precision():
-    try:
-        import torch
-        device = "cpu"
-        precision = torch.float32
-        device_msg = "CPU detected. Training will be slow."
-        if hasattr(torch, 'cuda') and torch.cuda.is_available():
-            device = "cuda"
-            precision = torch.float16
-            device_msg = "CUDA GPU detected. Using float16 for best performance."
-        elif hasattr(torch, 'has_mps') and torch.has_mps and torch.mps.is_available():
-            device = "mps"
-            precision = torch.float16
-            device_msg = "Apple MPS detected. Using float16 for best performance."
-        elif hasattr(torch, 'has_hip') and torch.has_hip and torch.has_hip():
-            device = "cuda"  # ROCm is seen as 'cuda' in torch
-            precision = torch.float16
-            device_msg = "AMD ROCm detected. Using float16 for best performance."
-        elif hasattr(torch, 'npu') and torch.npu.is_available():
-            device = "npu"
-            precision = torch.float16
-            device_msg = "NPU detected. Using float16 for best performance."
-        return device, precision, device_msg, torch.__version__
-    except Exception as e:
-        return "cpu", torch.float32, f"Device detection failed: {e}. Defaulting to CPU.", "unknown"
-
 # --- Sidebar: Hugging Face Token (Optional for default model) ---
-import os
 colab_hf_token = None
 try:
-    colab_hf_token = os.environ.get('HF_TOKEN', None)
-    if colab_hf_token:
-        st.sidebar.success('Hugging Face token extracted from environment successfully (HF_TOKEN).')
-    else:
-        st.sidebar.info('No Hugging Face token found in environment. You can enter it below.')
+    # Try Colab secret storage first
+    try:
+        from google.colab import userdata
+        colab_hf_token = userdata.get('HF_TOKEN')
+        if colab_hf_token:
+            log_info('Hugging Face token extracted from Colab secret storage (userdata).')
+    except Exception:
+        pass
+    # Fallback to environment variable
+    if not colab_hf_token:
+        colab_hf_token = os.environ.get('HF_TOKEN', None)
+        if colab_hf_token:
+            log_info('Hugging Face token extracted from environment successfully (HF_TOKEN).')
+    if not colab_hf_token:
+        log_info('No Hugging Face token found in Colab secrets or environment. You can enter it below.')
 except Exception as e:
-    st.sidebar.warning(f'Error checking environment for Hugging Face token: {e}')
+    log_exception(f'Error checking for Hugging Face token: {e}')
 
 hf_token_global = st.sidebar.text_input(
     "Hugging Face Token",
@@ -631,6 +244,47 @@ hf_token_global = st.sidebar.text_input(
     key="hf_token_global",
     value=colab_hf_token if colab_hf_token else ""
 )
+
+# --- Log management UI ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Log Management")
+if st.sidebar.button("Clear Log File"):
+    clear_log_file()
+    st.sidebar.success("Log file cleared.")
+download_log_file()
+
+# --- Optional: Email Log for Support ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Email Log for Support (Optional)")
+support_email = st.sidebar.text_input("Support Email Address (optional)", value="", key="support_email")
+if support_email:
+    st.sidebar.markdown("You can send the log file to support for debugging. SMTP setup required.")
+    smtp_host = st.sidebar.text_input("SMTP Host", value=os.environ.get("SMTP_HOST", ""), key="smtp_host")
+    smtp_port = st.sidebar.number_input("SMTP Port", min_value=1, max_value=65535, value=int(os.environ.get("SMTP_PORT", 587)), key="smtp_port")
+    smtp_user = st.sidebar.text_input("SMTP Username", value=os.environ.get("SMTP_USER", ""), key="smtp_user")
+    smtp_pass = st.sidebar.text_input("SMTP Password", type="password", value=os.environ.get("SMTP_PASS", ""), key="smtp_pass")
+    sender_email = st.sidebar.text_input("Sender Email", value=os.environ.get("SENDER_EMAIL", ""), key="sender_email")
+    if st.sidebar.button("Send Log File via Email"):
+        try:
+            import smtplib
+            from email.message import EmailMessage
+            with open(LOG_FILE, "rb") as f:
+                log_data = f.read()
+            msg = EmailMessage()
+            msg["Subject"] = "LoRA UI Log File"
+            msg["From"] = sender_email or smtp_user
+            msg["To"] = support_email
+            msg.set_content("Attached is the LoRA UI log file for support/debugging.")
+            msg.add_attachment(log_data, maintype="application", subtype="octet-stream", filename="lora_ui.log")
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            st.sidebar.success(f"Log file sent to {support_email}.")
+            log_info(f"Log file sent to {support_email} via email.")
+        except Exception as e:
+            log_exception(f"Failed to send log file via email: {e}\nCheck SMTP settings and network connectivity.")
+            st.sidebar.error("Failed to send email. See logs for details.")
 
 # --- System Resource Detection ---
 def get_system_resources():
@@ -687,6 +341,63 @@ st.title("LoRA Training UI (Easy & Advanced Modes)")
 st.subheader("1. Upload Images")
 images = st.file_uploader("Upload images for LoRA training", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
+if images:
+    # Always show images in the UI
+    st.write("### Uploaded Images")
+    # --- Auto-caption/tag logic ---
+    auto_captions = st.session_state.get('auto_captions', None)
+    captions_ready = auto_captions is not None and len(auto_captions) == len(images)
+    if caption_mode == "Automatic (Recommended)":
+        log_info(f"Using {'BLIP' if caption_type == 'Caption (Sentence)' else 'CLIP Interrogator'} model for automatic {caption_type.lower()}.")
+        if st.button("Auto Caption/Tag All Images"):
+            with st.spinner("Downloading captioning/tagging model and generating captions/tags for all images..."):
+                try:
+                    if caption_type == "Caption (Sentence)":
+                        gen_captions = generate_captions_for_images(
+                            images,
+                            hf_token_global,
+                            cap_hf_id if cap_source == "Hugging Face (repo ID)" else None,
+                            cap_local_file if cap_source == "Local Upload (.zip)" else None
+                        )
+                    else:
+                        gen_captions = generate_tags_for_images(
+                            images,
+                            tag_hf_id if tag_source == "Hugging Face (repo ID)" else None,
+                            tag_local_file if tag_source == "Local Upload (.zip)" else None
+                        )
+                    # Only set session state if all captions are generated successfully
+                    if gen_captions and len(gen_captions) == len(images):
+                        for idx, cap in enumerate(gen_captions):
+                            st.session_state[f"caption_{idx}"] = cap
+                        st.session_state['auto_captions'] = gen_captions
+                        # Rerun with compatibility
+                        if hasattr(st, "rerun"):
+                            st.rerun()
+                        else:
+                            st.experimental_rerun()
+                    else:
+                        log_error("Auto-captioning/tagging did not return captions for all images. Please try again.")
+                except Exception as e:
+                    # Clear any partial/failed results
+                    for idx in range(len(images)):
+                        st.session_state.pop(f"caption_{idx}", None)
+                    st.session_state.pop('auto_captions', None)
+                    log_exception(f"Auto-captioning/tagging failed: {e}")
+    # Set captions from auto_captions if available and not already set
+    if caption_mode == "Automatic (Recommended)" and captions_ready:
+        for idx, cap in enumerate(auto_captions):
+            if st.session_state.get(f"caption_{idx}") is None:
+                st.session_state[f"caption_{idx}"] = cap
+    # Render text areas for captions/tags
+    for idx, img in enumerate(images):
+        with st.container():
+            st.image(img, width=200, caption=img.name)
+            st.text_area(
+                f"{'Caption' if caption_type == 'Caption (Sentence)' else 'Tags'} for {img.name}",
+                value=st.session_state.get(f"caption_{idx}", ""),
+                key=f"caption_{idx}"
+            )
+
 # --- Step 2: Captioning (Default: Automatic) ---
 st.subheader("2. Captioning")
 caption_mode = st.radio("How do you want to provide captions/tags?", ("Automatic (Recommended)", "Manual"), index=0)
@@ -712,15 +423,15 @@ def model_source_dropdown(label, default_hf_id, local_key, cloud_key_prefix):
         cloud_provider = st.selectbox(f"Cloud Provider for {label} model", ["Google Drive", "OneDrive", "AWS S3", "Azure Blob", "GCP Storage"], key=f"{cloud_key_prefix}_provider")
         # Show mounting instructions dynamically
         if cloud_provider == "Google Drive":
-            st.info("To use Google Drive, run the mounting script or, in Colab, run:\n\nfrom google.colab import drive\ndrive.mount('/content/drive')\n\nThen enter the path to your model (e.g., /content/drive/MyDrive/my_model_dir).")
+            log_info("To use Google Drive, run the mounting script or, in Colab, run:\n\nfrom google.colab import drive\ndrive.mount('/content/drive')\n\nThen enter the path to your model (e.g., /content/drive/MyDrive/my_model_dir).")
         elif cloud_provider == "OneDrive":
-            st.info("To use OneDrive, run the mounting script or use rclone to mount your OneDrive remote. Then enter the mount path (e.g., /content/onedrive/my_model_dir). See README for details.")
+            log_info("To use OneDrive, run the mounting script or use rclone to mount your OneDrive remote. Then enter the mount path (e.g., /content/onedrive/my_model_dir). See README for details.")
         elif cloud_provider == "AWS S3":
-            st.info("To use AWS S3, run the mounting script or use rclone to mount your S3 bucket. Then enter the mount path (e.g., /content/s3bucket/my_model_dir). See README for details.")
+            log_info("To use AWS S3, run the mounting script or use rclone to mount your S3 bucket. Then enter the mount path (e.g., /content/s3bucket/my_model_dir). See README for details.")
         elif cloud_provider == "Azure Blob":
-            st.info("To use Azure Blob, run the mounting script or use rclone to mount your Azure remote. Then enter the mount path (e.g., /content/azure/my_model_dir). See README for details.")
+            log_info("To use Azure Blob, run the mounting script or use rclone to mount your Azure remote. Then enter the mount path (e.g., /content/azure/my_model_dir). See README for details.")
         elif cloud_provider == "GCP Storage":
-            st.info("To use Google Cloud Storage, run the mounting script or use rclone to mount your GCS bucket. Then enter the mount path (e.g., /content/gcs/my_model_dir). See README for details.")
+            log_info("To use Google Cloud Storage, run the mounting script or use rclone to mount your GCS bucket. Then enter the mount path (e.g., /content/gcs/my_model_dir). See README for details.")
         cloud_path = st.text_input(f"Path to {label} model in cloud storage (mounted path)", key=f"{cloud_key_prefix}_path")
         if cloud_provider in ["AWS S3", "Azure Blob", "GCP Storage"]:
             cloud_auth = st.text_area(f"Auth/config for {cloud_provider} (if needed)", key=f"{cloud_key_prefix}_auth")
@@ -757,63 +468,6 @@ with st.expander("Advanced Model Selection", expanded=False):
         )
         custom_code = st.text_area("Edit training config/code (Python)", value=default_code, height=180)
 
-if images:
-    # Always show images in the UI
-    st.write("### Uploaded Images")
-    # --- Auto-caption/tag logic ---
-    auto_captions = st.session_state.get('auto_captions', None)
-    captions_ready = auto_captions is not None and len(auto_captions) == len(images)
-    if caption_mode == "Automatic (Recommended)":
-        st.info(f"Using {'BLIP' if caption_type == 'Caption (Sentence)' else 'CLIP Interrogator'} model for automatic {caption_type.lower()}.")
-        if st.button("Auto Caption/Tag All Images"):
-            with st.spinner("Downloading captioning/tagging model and generating captions/tags for all images..."):
-                try:
-                    if caption_type == "Caption (Sentence)":
-                        gen_captions = generate_captions_for_images(
-                            images,
-                            hf_token_global,
-                            cap_hf_id if cap_source == "Hugging Face (repo ID)" else None,
-                            cap_local_file if cap_source == "Local Upload (.zip)" else None
-                        )
-                    else:
-                        gen_captions = generate_tags_for_images(
-                            images,
-                            tag_hf_id if tag_source == "Hugging Face (repo ID)" else None,
-                            tag_local_file if tag_source == "Local Upload (.zip)" else None
-                        )
-                    # Only set session state if all captions are generated successfully
-                    if gen_captions and len(gen_captions) == len(images):
-                        for idx, cap in enumerate(gen_captions):
-                            st.session_state[f"caption_{idx}"] = cap
-                        st.session_state['auto_captions'] = gen_captions
-                        # Rerun with compatibility
-                        if hasattr(st, "rerun"):
-                            st.rerun()
-                        else:
-                            st.experimental_rerun()
-                    else:
-                        st.error("Auto-captioning/tagging did not return captions for all images. Please try again.")
-                except Exception as e:
-                    # Clear any partial/failed results
-                    for idx in range(len(images)):
-                        st.session_state.pop(f"caption_{idx}", None)
-                    st.session_state.pop('auto_captions', None)
-                    st.error(f"Auto-captioning/tagging failed: {e}")
-    # Set captions from auto_captions if available and not already set
-    if caption_mode == "Automatic (Recommended)" and captions_ready:
-        for idx, cap in enumerate(auto_captions):
-            if st.session_state.get(f"caption_{idx}") is None:
-                st.session_state[f"caption_{idx}"] = cap
-    # Render text areas for captions/tags
-    for idx, img in enumerate(images):
-        with st.container():
-            st.image(img, width=200, caption=img.name)
-            st.text_area(
-                f"{'Caption' if caption_type == 'Caption (Sentence)' else 'Tags'} for {img.name}",
-                value=st.session_state.get(f"caption_{idx}", ""),
-                key=f"caption_{idx}"
-            )
-
 # --- Step 3: Base Model & LoRA Method (Default, with search/advanced) ---
 st.subheader("3. Base Model & LoRA Method")
 with st.expander("Show/Change Model (Advanced)", expanded=False):
@@ -832,15 +486,15 @@ with st.expander("Show/Change Model (Advanced)", expanded=False):
                 st.markdown(f"**{r['name']}**  \n_{r['desc']}_  \nTags: {r['tags']}")
                 # Example: Add a warning if model is large
                 if vram_gb and 'xl' in r['name'].lower() and vram_gb < 12:
-                    st.warning(f"Warning: {r['name']} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
+                    log_warning(f"Warning: {r['name']} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
         else:
-            st.warning("No models found or error searching Hugging Face.")
+            log_warning("No models found or error searching Hugging Face.")
     # --- Manual model selection ---
     custom_model_id = st.text_input("Or enter a custom model ID (Hugging Face)")
     if custom_model_id:
         # Example: Check for large models
         if vram_gb and ('xl' in custom_model_id.lower() or 'sdxl' in custom_model_id.lower()) and vram_gb < 12:
-            st.warning(f"Warning: {custom_model_id} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
+            log_warning(f"Warning: {custom_model_id} may require more VRAM than detected ({vram_gb} GB). Training or inference may fail or be very slow.")
 
 # --- Step 6: LoRA Metadata ---
 st.subheader("6. LoRA Metadata")
@@ -858,7 +512,7 @@ if st.button("Start LoRA Training"):
         auto_captions = st.session_state.get('auto_captions', None)
         captions_ready = auto_captions is not None and len(auto_captions) == len(images)
         if not captions_ready:
-            st.info("Auto-generating captions/tags for all images...")
+            log_info("Auto-generating captions/tags for all images...")
             try:
                 if caption_type == "Caption (Sentence)":
                     gen_captions = generate_captions_for_images(
@@ -881,71 +535,75 @@ if st.button("Start LoRA Training"):
                     else:
                         st.experimental_rerun()
                 else:
-                    st.error("Auto-captioning/tagging did not return captions for all images. Please try again.")
+                    log_error("Auto-captioning/tagging did not return captions for all images. Please try again.")
             except Exception as e:
                 st.session_state.pop('auto_captions', None)
-                st.error(f"Auto-captioning/tagging failed: {e}")
+                log_exception(f"Auto-captioning/tagging failed: {e}")
                 st.stop()
     # Validate all images have captions/tags
     missing = [idx for idx in range(len(images)) if not st.session_state.get(f"caption_{idx}", "").strip()]
     if missing:
-        st.error(f"Please provide a caption/tag for all images. Missing for: {', '.join(str(images[i].name) for i in missing)}")
+        log_error(f"Please provide a caption/tag for all images. Missing for: {', '.join(str(images[i].name) for i in missing)}")
     else:
         captions = [st.session_state.get(f"caption_{idx}", "") for idx in range(len(images))]
         output_dir = f"lora_output/{lora_model_name}"
-        st.info("Training LoRA... This may take a while.")
+        log_info("Training LoRA... This may take a while.")
         # --- Improved Device selection ---
         device, precision, device_msg, torch_version = get_best_device_and_precision()
-        st.info(f"{device_msg} (torch version: {torch_version})")
+        log_info(f"{device_msg} (torch version: {torch_version})")
         if device == "cpu":
-            st.warning("No supported accelerator detected. Training will be slow. For best performance, use a machine with a supported GPU, Apple Silicon (MPS), or AMD ROCm. See https://pytorch.org/get-started/locally/ for install instructions.")
-        result = train_lora(
-            images,
-            captions,
-            base_hf_id if base_source == "Hugging Face (repo ID)" else None,
-            lora_model_name,
-            lora_activation_keyword,
-            output_dir,
-            hf_token_global,
-            device,
-            adv_config=adv_config,
-            custom_code=custom_code,
-            precision=precision
-        )
-        if result == "trained":
-            st.success(f"LoRA training complete! Weights saved to {output_dir}")
-            st.session_state['trained_model_dir'] = output_dir
-            st.session_state['model_ready'] = True
-            # --- Automatically upload to Hugging Face ---
-            with st.spinner("Uploading model to Hugging Face Hub (private)..."):
-                try:
-                    from huggingface_hub import HfApi, whoami
-                    api = HfApi()
-                    # Get username from token
-                    user_info = api.whoami(token=hf_token_global)
-                    hf_username = user_info['name'] if 'name' in user_info else user_info.get('user', 'user')
-                    repo_id = f"{hf_username}/{hf_repo_name}"
-                    api.create_repo(name=hf_repo_name, exist_ok=True, token=hf_token_global, private=True)
-                    api.upload_folder(
-                        folder_path=output_dir,
-                        repo_id=repo_id,
-                        token=hf_token_global
-                    )
-                    repo_url = f"https://huggingface.co/{repo_id}"
-                    st.session_state['uploaded_repo_url'] = repo_url
-                    st.success(f"Model uploaded to Hugging Face (private): {repo_url}")
-                    st.markdown(f"[View on Hugging Face]({repo_url})")
-                except Exception as e:
-                    st.error(f"Automatic upload to Hugging Face failed: {e}")
-        else:
-            st.error("LoRA training failed. See above for details.")
+            log_warning("No supported accelerator detected. Training will be slow. For best performance, use a machine with a supported GPU, Apple Silicon (MPS), or AMD ROCm. See https://pytorch.org/get-started/locally/ for install instructions.")
+        try:
+            result = train_lora(
+                images,
+                captions,
+                base_hf_id if base_source == "Hugging Face (repo ID)" else None,
+                lora_model_name,
+                lora_activation_keyword,
+                output_dir,
+                hf_token_global,
+                device,
+                adv_config=adv_config,
+                custom_code=custom_code,
+                precision=precision
+            )
+            if result == "trained":
+                log_info(f"LoRA training complete! Weights saved to {output_dir}")
+                st.session_state['trained_model_dir'] = output_dir
+                st.session_state['model_ready'] = True
+                # --- Automatically upload to Hugging Face ---
+                with st.spinner("Uploading model to Hugging Face Hub (private)..."):
+                    try:
+                        from huggingface_hub import HfApi, whoami
+                        api = HfApi()
+                        # Get username from token
+                        user_info = api.whoami(token=hf_token_global)
+                        hf_username = user_info['name'] if 'name' in user_info else user_info.get('user', 'user')
+                        repo_id = f"{hf_username}/{hf_repo_name}"
+                        api.create_repo(name=hf_repo_name, exist_ok=True, token=hf_token_global, private=True)
+                        api.upload_folder(
+                            folder_path=output_dir,
+                            repo_id=repo_id,
+                            token=hf_token_global
+                        )
+                        repo_url = f"https://huggingface.co/{repo_id}"
+                        st.session_state['uploaded_repo_url'] = repo_url
+                        log_info(f"Model uploaded to Hugging Face (private): {repo_url}")
+                        st.markdown(f"[View on Hugging Face]({repo_url})")
+                    except Exception as e:
+                        log_exception(f"Automatic upload to Hugging Face failed: {e}")
+            else:
+                log_error("LoRA training failed. See above for details.")
+        except Exception as e:
+            log_exception(f"LoRA training encountered an unexpected error: {e}")
+
 # --- Always show image generation UI after training ---
 if st.session_state.get('model_ready', False):
     st.subheader("8. Model Download & Upload")
     model_dir = st.session_state['trained_model_dir']
     repo_url = st.session_state.get('uploaded_repo_url', None)
     if repo_url:
-        st.info(f"Model is available on Hugging Face (private): {repo_url}")
+        log_info(f"Model is available on Hugging Face (private): {repo_url}")
         st.markdown(f"[View on Hugging Face]({repo_url})")
     # Download option
     zip_path = f"{model_dir}.zip"
@@ -953,7 +611,7 @@ if st.session_state.get('model_ready', False):
         shutil.make_archive(model_dir, 'zip', model_dir)
     with open(zip_path, "rb") as f:
         st.download_button("Download Trained Model (.zip)", f, file_name=os.path.basename(zip_path))
-    st.info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
+    log_info(f"Model files are saved in: {model_dir} (Colab: /content/Lora_trainer/{model_dir})")
     # --- Step 9: Generate Images with Trained Model (Prompt Queue) ---
     st.subheader("9. Generate Images with Trained Model")
     def prepend_lora_keyword(prompt, keyword):
@@ -972,7 +630,7 @@ if st.session_state.get('model_ready', False):
     if 'queued_num_images' not in st.session_state:
         st.session_state['queued_num_images'] = 1
     # Prompt queue UI
-    st.info("You can queue prompts and settings below. Images will be generated automatically as soon as training completes. The LoRA activation keyword will be included in each prompt.")
+    log_info("You can queue prompts and settings below. Images will be generated automatically as soon as training completes. The LoRA activation keyword will be included in each prompt.")
     for i, prompt in enumerate(st.session_state['queued_prompts']):
         user_prompt = st.text_input(f"Prompt {i+1}", value=prompt, key=f"queued_prompt_{i}")
         st.session_state['queued_prompts'][i] = prepend_lora_keyword(user_prompt, lora_activation_keyword)
@@ -1002,4 +660,13 @@ if st.session_state.get('model_ready', False):
                     for img in images:
                         st.image(img)
             except Exception as e:
-                st.error(f"Image generation failed: {e}")
+                log_exception(f"Image generation failed: {e}")
+
+# --- UI: Download logs ---
+with st.sidebar.expander("Logs & Diagnostics", expanded=False):
+    st.markdown("**Download logs for support or debugging:**")
+    try:
+        with open(LOG_FILE, "rb") as f:
+            st.download_button("Download Log File (lora_ui.log)", f, file_name="lora_ui.log")
+    except Exception:
+        log_info("No log file yet. Logs will be available after running the workflow.")

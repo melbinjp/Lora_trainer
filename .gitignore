@@ -2,3 +2,4 @@ streamlitenv
 lora_output
 __pycache__
 cloudflared.exe
+lora_ui.log
