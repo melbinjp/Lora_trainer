@@ -16,7 +16,9 @@
      ```bat
      setup.bat
      ```
-3. Start the app:
+   These scripts will install dependencies from `requirements.txt`.
+3. **Set up LoRA Training Backend**: See the "LoRA Training Backend (Kohya_ss SD Scripts)" section below for crucial steps to enable training.
+4. Start the app:
    ```sh
    streamlit run test.py
    ```
@@ -25,7 +27,8 @@
 
 1. Open `colab_quickstart.ipynb` in Colab.
 2. Run all cells. The UI will be available via a public link (look for the `trycloudflare.com` URL in the output).
-3. (Optional) For persistent tunnels, see the Cloudflared Auth section below.
+3. The Colab notebook automatically attempts to clone Kohya_ss's `sd-scripts` into the correct location (`/content/Lora_trainer/sd-scripts/`) for training functionality.
+4. (Optional) For persistent tunnels, see the Cloudflared Auth section below.
 
 ### Hugging Face Token (for private/custom models)
 - Go to https://huggingface.co/settings/tokens
@@ -47,7 +50,49 @@
 
 1. Clone your repo and enter the `Lora_trainer` folder.
 2. Run `bash setup.sh` (Linux) or `setup.bat` (Windows).
-3. Start Streamlit as above.
+3. **Set up LoRA Training Backend**: See the "LoRA Training Backend (Kohya_ss SD Scripts)" section below.
+4. Start Streamlit as above.
+
+---
+
+## LoRA Training Backend (Kohya_ss SD Scripts)
+
+The LoRA training functionality in this application relies on **Kohya_ss's `sd-scripts`** (specifically `train_network.py` and its associated scripts and dependencies). You need to make these scripts available for the training features to work.
+
+### Setup Methods:
+
+1.  **Recommended Method (Clone into `Lora_trainer`):**
+    *   Navigate to the root directory of your cloned `Lora_trainer` repository.
+    *   Clone the `sd-scripts` repository from GitHub into a folder named `sd-scripts`:
+        ```bash
+        git clone https://github.com/kohya-ss/sd-scripts.git sd-scripts
+        ```
+    *   The application will automatically look for the training script at `sd-scripts/train_network.py`.
+
+2.  **Alternative Methods:**
+    *   **PATH Environment Variable:** If you have a full installation of Kohya_ss's `sd-scripts` elsewhere on your system, ensure that the directory containing `train_network.py` is added to your system's PATH environment variable.
+    *   **Directory Placement:** Alternatively, place your existing `sd-scripts` directory (or a directory named `kohya_ss` containing the scripts) directly into the root of the `Lora_trainer` repository. The application checks these locations:
+        *   `./sd-scripts/train_network.py`
+        *   `./kohya_ss/train_network.py`
+
+### `accelerate` for Launching Training:
+
+*   The training script (`train_network.py`) is launched using Hugging Face's **`accelerate`** library. This library is included in `requirements.txt` and should be installed by the setup scripts.
+*   `accelerate` helps manage training across different hardware setups (CPU, single GPU, multiple GPUs, MPS).
+*   For multi-GPU training or specific hardware configurations (like TPUs, or if you encounter device-related errors), you may need to configure `accelerate`. Run the following command in your terminal within the `Lora_trainer` environment:
+    ```bash
+    accelerate config
+    ```
+    Follow the prompts to set up your configuration (e.g., selecting GPU type, number of GPUs, mixed precision). The application will use this configuration when launching training. If no custom configuration is found, `accelerate` will use sensible defaults.
+
+### Key Dependencies for `sd-scripts`:
+
+*   Most core dependencies like `torch`, `transformers`, `diffusers`, and `accelerate` are included in the main `requirements.txt`.
+*   Kohya_ss's `sd-scripts` may have additional dependencies for certain advanced features (e.g., specific optimizers like AdamW8bit via `bitsandbytes`, or `prodigyopt`). If you intend to use these advanced features through the "Custom Code" options in the UI, you might need to install them manually into your Python environment:
+    ```bash
+    pip install bitsandbytes prodigyopt # Example for optional dependencies
+    ```
+    Refer to the Kohya_ss `sd-scripts` repository for its full list of dependencies and installation instructions if you plan to heavily customize the training parameters.
 
 ---
 
@@ -205,3 +250,5 @@ You can load models from cloud storage for persistent and large-scale use. Suppo
 - The app will prioritize local uploads, then cloud/local paths, then Hugging Face.
 
 For more details, see the advanced UI section in the app and the comments in `test.py`.
+
+[end of README.md]
