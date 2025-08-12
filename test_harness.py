@@ -66,17 +66,15 @@ def run_workflow():
     try:
         print("[TEST] Starting LoRA training (minimal config, CPU)...")
         result = lora_ui.train_lora(
-            images,
-            captions,
-            SAMPLE_MODEL_ID,
-            SAMPLE_LORA_NAME,
-            SAMPLE_ACTIVATION_KEYWORD,
-            SAMPLE_OUTPUT_DIR,
-            None,  # No HF token for public model
-            "cpu",
-            adv_config={"epochs": 1, "batch_size": 1, "lora_rank": 2, "lora_alpha": 2},
-            custom_code=None,
-            precision=None
+            images=images,
+            captions=captions,
+            base_model_id=SAMPLE_MODEL_ID,
+            output_dir=SAMPLE_OUTPUT_DIR,
+            num_train_epochs=1,
+            train_batch_size=1,
+            lora_rank=2,
+            learning_rate=1e-4,
+            hf_token=None
         )
         if result == "trained":
             results["lora_training"] = True

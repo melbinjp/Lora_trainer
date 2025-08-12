@@ -4,9 +4,11 @@ huggingface_hub
 Pillow
 requests
 torch
+torchvision
 peft
 diffusers
 clip-interrogator
 numpy
 tqdm
 accelerate
+datasets
