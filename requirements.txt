@@ -1,14 +1,13 @@
-streamlit
 transformers
 huggingface_hub
 Pillow
 requests
-torch
-torchvision
 peft
 diffusers
-clip-interrogator
 numpy
 tqdm
 accelerate
 datasets
+fastapi
+uvicorn[standard]
+python-dotenv

@@ -2,12 +2,17 @@ import os
 import logging
 import pytest
 from unittest import mock
+import sys
 
-# Import functions from test.py
-from test import detect_model_type, get_system_resources, LOG_FILE
+# Add src to path
+sys.path.append(os.path.join(os.path.dirname(__file__), "../../src"))
+
+# Import functions from helpers
+from utils.helpers import detect_model_type, get_system_resources, LOG_FILE, setup_logging
 
 # --- Logging helpers ---
 def test_log_file_write_and_clear():
+    setup_logging()
     # Write to log
     logging.info("Test log entry")
     assert os.path.exists(LOG_FILE)
@@ -43,7 +48,7 @@ def test_get_system_resources():
 def test_detect_model_type_handles_exception(monkeypatch):
     def raise_exc(*args, **kwargs):
         raise Exception("fail")
-    monkeypatch.setattr("test.detect_model_type", raise_exc)
+    monkeypatch.setattr("utils.helpers.detect_model_type", raise_exc)
     # Should not raise, just fallback to unknown
     try:
         result = detect_model_type("fail-model")

@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LoRA Inference</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; display: flex; gap: 20px; }
+        .sidebar { flex: 1; background: #1e1e1e; padding: 20px; border-radius: 8px; height: fit-content;}
+        .main { flex: 2; background: #1e1e1e; padding: 20px; border-radius: 8px; }
+        input, select, textarea, button { width: 100%; box-sizing: border-box; margin-bottom: 15px; padding: 10px; background: #2d2d2d; color: white; border: 1px solid #444; border-radius: 4px; }
+        button { background: #007bff; border: none; cursor: pointer; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #444; cursor: not-allowed; }
+        .progress-container { margin-bottom: 10px; padding: 10px; background: #2a2a2a; border-radius: 4px;}
+        .progress-bar { width: 100%; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px; }
+        .progress-fill { height: 10px; background: #007bff; width: 0%; transition: width 0.2s; }
+        .status-text { font-size: 0.9em; color: #aaa; margin-top: 5px; }
+        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 20px;}
+        .gallery img { width: 100%; border-radius: 8px; display: block;}
+        label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 0.9em; color: #bbb; }
+        .checkbox-label { display: flex; align-items: center; gap: 10px; font-weight: normal; margin-bottom: 15px;}
+        .checkbox-label input { width: auto; margin: 0; }
+        .slider-row { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; }
+        .slider-row input[type="range"] { margin-bottom: 0; }
+        .slider-row span { min-width: 30px; text-align: right; }
+    </style>
+</head>
+<body>
+    <h1>🎨 High-Fidelity Personal LoRA Workflow</h1>
+    <div class="container">
+        <div class="sidebar">
+            <h3>Configuration</h3>
+            <label>Hardware Target</label>
+            <select id="hardware">
+                <option value="STABLE_HYBRID">Intel Optimized (STABLE_HYBRID)</option>
+                <option value="CPU">Standard (CPU)</option>
+                <option value="GPU">Intel iGPU (GPU)</option>
+            </select>
+
+            <label>Base Model</label>
+            <select id="model"></select>
+            
+            <label>Hugging Face Token</label>
+            <input type="password" id="token" placeholder="Optional for Schnell, required for Dev">
+
+            <label>Inference Steps</label>
+            <div class="slider-row">
+                <input type="range" id="steps" min="1" max="20" value="4" oninput="document.getElementById('steps_val').innerText = this.value">
+                <span id="steps_val">4</span>
+            </div>
+
+            <label>Guidance Scale</label>
+            <div class="slider-row">
+                <input type="range" id="guidance" min="0" max="10" step="0.1" value="0.0" oninput="document.getElementById('guid_val').innerText = this.value">
+                <span id="guid_val">0.0</span>
+            </div>
+
+            <label>Number of Images</label>
+            <input type="number" id="num_images" min="1" max="20" value="1">
+
+            <label>Seed (-1 for random)</label>
+            <input type="number" id="seed" value="-1">
+
+            <label>Resolution</label>
+            <select id="resolution_preset" onchange="toggleCustomRes(this.value)">
+                <option value="512x512">512 x 512 (Fast)</option>
+                <option value="768x768">768 x 768</option>
+                <option value="1024x1024">1024 x 1024 (HD)</option>
+                <option value="custom">Custom...</option>
+            </select>
+            <div id="custom_res_container" style="display:none; margin-top:10px; gap:5px; align-items:center;">
+                <input type="number" id="width" value="512" style="width:70px;"> 
+                <span>x</span>
+                <input type="number" id="height" value="512" style="width:70px;">
+            </div>
+        </div>
+
+        <div class="main">
+            <h3>Inference Settings</h3>
+            <label>Prompt</label>
+            <textarea id="prompt" rows="3">a turtle with a flower</textarea>
+            
+            <label class="checkbox-label">
+                <input type="checkbox" id="enhance_prompt">
+                ✨ Auto-Enhance Prompt with Local AI (100% Offline)
+            </label>
+
+            <button id="generate_btn" onclick="startGeneration()">🚀 Generate Image(s)</button>
+            <button id="cancel_btn" onclick="cancelTask()" style="background: #444; margin-top: 10px; display: none;">🛑 Stop / Reset</button>
+
+            <div id="progress_area"></div>
+            
+            <h3>Gallery</h3>
+            <div class="gallery" id="gallery"></div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchModelsStatus() {
+            try {
+                const res = await fetch('/models_status');
+                const data = await res.json();
+                const select = document.getElementById('model');
+                
+                const getLabel = (key, name, desc) => {
+                    const status = data[key] ? "✅ Local" : "⏳ Download Need";
+                    return `${name} (${status}) - ${desc}`;
+                };
+
+                select.innerHTML = `
+                    <option value="OpenVINO/FLUX.1-schnell-int4-ov">${getLabel('schnell', 'Flux.1 Schnell', 'High Qual, 11GB RAM')}</option>
+                    <option value="OpenVINO/stable-diffusion-xl-turbo-int4-ov">${getLabel('sdxl_turbo', 'SDXL Turbo', 'High Speed, 4GB RAM')}</option>
+                    <option value="OpenVINO/stable-diffusion-v1.5-lcm-int8-ov">${getLabel('sd15_lcm', 'SD 1.5 LCM', 'Ultra Fast, 1GB RAM')}</option>
+                `;
+            } catch(e) {
+                console.error(e);
+            }
+        }
+
+        async function startGeneration() {
+            await generateImage();
+        }
+
+        function toggleCustomRes(val) {
+            document.getElementById('custom_res_container').style.display = (val === 'custom') ? 'flex' : 'none';
+        }
+
+        async function generateImage(existingPayload = null, existingNumImages = null) {
+            const promptVal = existingPayload ? existingPayload.prompt : document.getElementById('prompt').value;
+            const model = existingPayload ? existingPayload.model : document.getElementById('model').value;
+            const hardware = existingPayload ? existingPayload.hardware_target : document.getElementById('hardware').value;
+            const steps = existingPayload ? existingPayload.steps : parseInt(document.getElementById('steps').value);
+            const guidance = existingPayload ? existingPayload.guidance : parseFloat(document.getElementById('guidance').value);
+            const token = existingPayload ? existingPayload.token : document.getElementById('token').value;
+            const numImages = existingNumImages || parseInt(document.getElementById('num_images').value);
+            const seed = existingPayload ? existingPayload.seed : parseInt(document.getElementById('seed').value);
+            
+            let width, height;
+            if (existingPayload) {
+                width = existingPayload.width;
+                height = existingPayload.height;
+            } else {
+                const preset = document.getElementById('resolution_preset').value;
+                if (preset === 'custom') {
+                    width = parseInt(document.getElementById('width').value);
+                    height = parseInt(document.getElementById('height').value);
+                } else {
+                    [width, height] = preset.split('x').map(Number);
+                }
+            }
+            
+            if (!promptVal) {
+                alert("Please enter a prompt!");
+                return;
+            }
+
+            const btn = document.getElementById('generate_btn');
+            const cancelBtn = document.getElementById('cancel_btn');
+            btn.disabled = true;
+            cancelBtn.style.display = 'block';
+            
+            const progressArea = document.getElementById('progress_area');
+            const gallery = document.getElementById('gallery');
+            let prompt = promptVal;
+
+            if (!existingPayload && document.getElementById('enhance_prompt').checked) {
+                progressArea.innerHTML = `<div class="status-text" style="margin-bottom:10px;">🤖 Local AI is enhancing your prompt (Offline)...</div>`;
+                try {
+                    const res = await fetch('/enhance_prompt', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({prompt: prompt})
+                    });
+                    
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder("utf-8");
+                    document.getElementById('prompt').value = ""; // Clear existing prompt
+                    
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        
+                        const chunk = decoder.decode(value, {stream: true});
+                        const lines = chunk.split('\\n');
+                        for(let line of lines) {
+                            if(!line.trim()) continue;
+                            try {
+                                const data = JSON.parse(line);
+                                if(data.token) {
+                                    document.getElementById('prompt').value += data.token;
+                                } else if(data.error) {
+                                    console.error(data.error);
+                                }
+                            } catch(e) {
+                                console.error("Parse error:", e, line);
+                            }
+                        }
+                    }
+                    prompt = document.getElementById('prompt').value;
+                    progressArea.innerHTML = `<div class="status-text" style="margin-bottom:10px; color: #44ff44;">✨ Prompt enhanced successfully!</div>`;
+                } catch(e) {
+                    console.error(e);
+                }
+            }
+
+            progressArea.innerHTML = '';
+            
+            const containerId = `prog_batch`;
+            progressArea.innerHTML = `
+                <div class="progress-container" id="${containerId}">
+                    <div style="font-weight:bold; margin-bottom:5px;" id="batch_header">Batch Progress</div>
+                    <div class="progress-bar"><div class="progress-fill" id="${containerId}_fill"></div></div>
+                    <div class="status-text" id="${containerId}_text">Initializing batch...</div>
+                </div>
+            `;
+            
+            const payload = existingPayload || {
+                prompt: prompt,
+                model: model,
+                hardware_target: hardware,
+                steps: steps,
+                guidance: guidance,
+                num_images: numImages,
+                width: width,
+                height: height,
+                seed: seed
+            };
+            if (!existingPayload && token) payload.token = token;
+
+            try {
+                const response = await fetch('/generate_stream', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder("utf-8");
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value, {stream: true});
+                    const lines = chunk.split('\\n');
+                    for(let line of lines) {
+                        if(!line.trim()) continue;
+                        try {
+                            const data = JSON.parse(line);
+                            const textEl = document.getElementById(`${containerId}_text`);
+                            const fillEl = document.getElementById(`${containerId}_fill`);
+                            
+                            if(data.type === 'log') {
+                                if(data.data.includes('[START_IMAGE]')) {
+                                    const imgNum = parseInt(data.data.split('[START_IMAGE]')[1].trim()) + 1;
+                                    document.getElementById('batch_header').innerText = `Generating Image ${imgNum} of ${numImages}`;
+                                    fillEl.style.width = '0%';
+                                } else if(data.data.includes('[PROGRESS]')) {
+                                    const match = data.data.match(/\\((\\d+\\.\\d+)%\\)/);
+                                    if(match) {
+                                        fillEl.style.width = match[1] + '%';
+                                        textEl.innerText = 'Denoising: ' + data.data.split('[PROGRESS]')[1].trim();
+                                    }
+                                } else {
+                                    textEl.innerText = data.data;
+                                }
+                            } else if(data.type === 'result') {
+                                const img = document.createElement('img');
+                                img.src = 'data:image/png;base64,' + data.data;
+                                gallery.prepend(img);
+                            } else if(data.type === 'error') {
+                                textEl.innerText = 'Error: ' + data.data;
+                                textEl.style.color = '#ff4444';
+                            }
+                        } catch(e) { }
+                    }
+                }
+            } catch(e) {
+                console.error("Network error:", e);
+            } finally {
+                btn.disabled = false;
+                cancelBtn.style.display = 'none';
+            }
+        }
+
+        async function cancelTask() {
+            if (!confirm("Are you sure you want to stop the current generation?")) return;
+            try {
+                await fetch('/cancel_task', {method: 'POST'});
+            } catch(e) { console.error(e); }
+        }
+
+        async function checkActiveTask() {
+            try {
+                const res = await fetch('/get_current_task');
+                const data = await res.json();
+                if (data.status === 'running') {
+                    console.log("Re-attaching to active task...");
+                    generateImage(data.request, data.num_images);
+                }
+            } catch(e) {
+                console.error("Error checking active task:", e);
+            }
+        }
+
+        window.onload = () => {
+            fetchModelsStatus();
+            checkActiveTask();
+        };
+    </script>
+</body>
+</html>
